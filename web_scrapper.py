@@ -177,18 +177,19 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     # 3) Type target domain
     try:
         await search_input.type(target_domain, delay=random.randint(60, 120))
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2500)
     except Exception as e:
         return False, f"Could not type search term: {e}", None
 
-    # 4) Wait for dropdown
-    await page.wait_for_timeout(1500)
+    # 4) Wait for dropdown and possible API results
+    await page.wait_for_timeout(3500)
 
     candidate_rows = []
     retry = 0
     while True:
         # Apollo often portals dropdown into body, so search broadly
         row_selectors = [
+            "a[href*='organizations']",
             "a",
             "button",
             "[role='option']",
@@ -208,7 +209,6 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                 print ("-----------------------------------------------------")
 
                 temp = []
-                # for i in range(min(count, 200)):
                 for i in range(count):
                     row = rows.nth(i)
                     try:
@@ -220,17 +220,27 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                         if len(norm_text) < 3:
                             continue
 
-                        # Keep only things that look like search results
+                        href = (await row.get_attribute("href")) or ""
+
+                        # Reject generic category links (e.g. #/companies) - not company org pages
+                        if href and "/organizations/" not in href and "#/organizations/" not in href:
+                            if "#/companies" in href or href.strip() in ("#/companies", "/companies"):
+                                continue
+
+                        # Keep only rows that look like actual company search results
+                        has_domain = target_domain in norm_text
+                        has_name = target_name and target_name in norm_text
+                        has_org_link = "/organizations/" in href or "#/organizations/" in href
+
                         looks_relevant = (
-                            target_domain in norm_text
-                            or "companies" in norm_text
-                            or (target_name and target_name in norm_text)
+                            has_domain
+                            or (has_name and has_org_link)
+                            or (has_org_link and ("companies" in norm_text or target_domain in norm_text))
                         )
 
                         if not looks_relevant:
                             continue
 
-                        href = await row.get_attribute("href")
                         temp.append({
                             "locator": row,
                             "text": text,
@@ -241,7 +251,6 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                     except Exception:
                         continue
 
-                # Use the first selector that gives plausible candidates
                 if temp:
                     candidate_rows = temp
                     print(f"Collected {len(candidate_rows)} candidate nodes using selector: {row_selector}")
@@ -251,10 +260,10 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                 print(f"Row selector failed: {row_selector} -> {e}")
 
         if not candidate_rows:
-            if retry > 3:
+            if retry > 4:
                 return False, "No candidate companies appeared", None
             retry = retry + 1
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)
         else:
             break
 
@@ -264,13 +273,18 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
         print(c["text"][:400])
         print("-" * 100)
 
-    # 5) Score candidates
+    # 5) Score candidates - only consider rows that link to an organization page
     scored_candidates = []
 
     for c in candidate_rows:
+        href = (c["href"] or "").lower()
+
+        # Must link to an organization page - reject #/companies and similar
+        if "/organizations/" not in href and "#/organizations/" not in href:
+            continue
+
         score = 0
         text = c["norm_text"]
-        href = (c["href"] or "").lower()
 
         # Domain match is king
         if target_domain == text:
@@ -278,13 +292,12 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
         if target_domain in text:
             score += 50
 
-        # Name helps, but not enough by itself
+        # Name helps
         if target_name and target_name in text:
             score += 20
 
-        # Company/org links get bonus
-        if "/organizations/" in href or "#/organizations/" in href:
-            score += 15
+        # Company/org links (already required above)
+        score += 15
 
         # If the row clearly belongs to company results
         if "companies" in text:
@@ -641,14 +654,22 @@ async def main():
                         break
 
                 if not result:
-                    print(f"No matching company found for {company_domain}. Skipping.")
+                    print(f"No matching company found for {company_domain}. Marking company_id={company_id} to avoid infinite retry.")
+                    try:
+                        await end_company(company_id)
+                    except Exception as e:
+                        print(f"Failed to mark company_id={company_id}: {e}")
                     continue
 
                 people_url = build_people_url_from_company_url(company_url or page.url)
                 print("Derived people URL:", people_url)
 
                 if not people_url:
-                    print("Could not derive people URL from company page. Skipping.")
+                    print("Could not derive people URL from company page. Marking company_id={company_id} to avoid infinite retry.")
+                    try:
+                        await end_company(company_id)
+                    except Exception as e:
+                        print(f"Failed to mark company_id={company_id}: {e}")
                     continue
 
                 ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
