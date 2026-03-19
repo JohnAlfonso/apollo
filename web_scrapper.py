@@ -182,7 +182,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
         return False, f"Could not type search term: {e}", None
 
     # 4) Wait for dropdown and possible API results
-    await page.wait_for_timeout(3500)
+    await page.wait_for_timeout(2500)
 
     candidate_rows = []
     retry = 0
@@ -234,7 +234,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 
                         looks_relevant = (
                             has_domain
-                            or (has_name and has_org_link)
+                            or (has_name or has_org_link)
                             or (has_org_link and ("companies" in norm_text or target_domain in norm_text))
                         )
 
@@ -278,13 +278,9 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 
     for c in candidate_rows:
         href = (c["href"] or "").lower()
-
-        # Must link to an organization page - reject #/companies and similar
-        if "/organizations/" not in href and "#/organizations/" not in href:
-            continue
+        text = c["norm_text"]
 
         score = 0
-        text = c["norm_text"]
 
         # Domain match is king
         if target_domain == text:
@@ -296,12 +292,18 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
         if target_name and target_name in text:
             score += 20
 
-        # Company/org links (already required above)
-        score += 15
+        # Org link is a strong bonus but NOT a hard requirement
+        # (Apollo dropdown items may use React onClick with no href)
+        if "/organizations/" in href or "#/organizations/" in href:
+            score += 15
 
         # If the row clearly belongs to company results
         if "companies" in text:
             score += 5
+
+        # Must have at least some signal — skip completely unrelated rows
+        if score == 0:
+            continue
 
         scored_candidates.append((score, c))
 
@@ -464,7 +466,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             result, reason = await click_next_pagination(page)
             print("click_next_pagination:", result, reason)
 
-            if result:
+            if "not found" in reason.lower() or "disabled" in reason.lower():
                 break
 
             await asyncio.sleep(random.randint(4, 8))
@@ -486,7 +488,7 @@ def parse_args():
     parser.add_argument(
         "--sources",
         type=str,
-        default=os.environ.get("SOURCES", ""),
+        default=os.environ.get("SOURCES", "hunter.io-50-1000"),
         help="Comma-separated source values to filter companies (optional)",
     )
     return parser.parse_args()
@@ -629,6 +631,7 @@ async def main():
                 company_id = rec.get("id")
                 website = rec.get("website", "")
                 name = rec.get("name", "")
+                company_source = rec.get("source", "")
 
                 company_domain = extract_domain_from_url(website)
                 company_name = name.strip() if name else None
@@ -637,6 +640,7 @@ async def main():
                 print(f"TARGET {idx} (company_id={company_id})")
                 print(f"company_domain = {company_domain}")
                 print(f"company_name   = {company_name}")
+                print(f"company_source = {company_source}")
                 print("#" * 120)
 
                 while True:
