@@ -16,7 +16,7 @@ HOME_URL = "https://app.apollo.io/#/home"
 REQUEST_LOG_FILE = "apollo_requests.json"
 RESPONSE_LOG_FILE = "apollo_responses.json"
 
-BACKEND_API_URL = os.environ.get("BACKEND_API_URL", "http://localhost:9900")
+BACKEND_API_URL = os.environ.get("BACKEND_API_URL", "http://95.217.116.91:9900")
 DEBUG_LOG_RESPONSES = os.environ.get("APOLLO_DEBUG_LOG", "").lower() in ("1", "true", "yes")
 
 
