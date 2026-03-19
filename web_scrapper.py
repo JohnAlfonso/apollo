@@ -1,9 +1,13 @@
+import argparse
 import asyncio
 import json
+import os
 import random
 import re
 from pathlib import Path
 from urllib.parse import urlparse
+
+import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 STATE_FILE = "apollo_state.json"
@@ -11,6 +15,9 @@ HOME_URL = "https://app.apollo.io/#/home"
 
 REQUEST_LOG_FILE = "apollo_requests.json"
 RESPONSE_LOG_FILE = "apollo_responses.json"
+
+BACKEND_API_URL = os.environ.get("BACKEND_API_URL", "http://localhost:9900")
+DEBUG_LOG_RESPONSES = os.environ.get("APOLLO_DEBUG_LOG", "").lower() in ("1", "true", "yes")
 
 
 def is_interesting_request(url: str, resource_type: str) -> bool:
@@ -82,6 +89,37 @@ async def dump_json(path: str, data):
         print(f"Saved: {path}")
     except Exception as e:
         print(f"Failed to save {path}: {e}")
+
+
+async def fetch_companies(sources: str | None = None) -> list[dict]:
+    """Fetch companies from backend API (company_check=1, modified_time IS NULL)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/companies"
+    params = {}
+    if sources and sources.strip():
+        params["sources"] = sources.strip()
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, params=params or None)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("records", [])
+
+
+async def save_apollo_page(company_id: int, apollo_json: str) -> dict | None:
+    """Save Apollo page response to backend (inserts people, sets created_time)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/process"
+    payload = {"company_id": company_id, "apollo_json": apollo_json}
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def end_company(company_id: int) -> None:
+    """Set modified_time for company in backend."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/end/{company_id}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
 
 
 async def search_company_on_searchtag(page, company_domain: str, company_name: str | None = None):
@@ -388,52 +426,67 @@ async def click_next_pagination(page):
     return False, "Clicked Next successfully"
 
 
-async def open_people_page_and_run_old_logic(page, people_url: str):
-    print(f"Opening people page: {people_url}")
-    await page.goto(people_url, wait_until="domcontentloaded")
-
+async def open_people_page_and_run_old_logic(page, people_url: str, company_id: int, ctx: dict):
+    """Open people page, paginate, save each page via handle_response, call end_company when done."""
+    ctx["current_company_id"] = company_id
     try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
-    except PlaywrightTimeoutError:
-        print("networkidle timeout; continuing")
+        print(f"Opening people page: {people_url}")
+        await page.goto(people_url, wait_until="domcontentloaded")
 
-    print("Current URL:", page.url)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except PlaywrightTimeoutError:
+            print("networkidle timeout; continuing")
 
-    if "#/login" in page.url:
-        return False, "Session expired or invalid"
+        print("Current URL:", page.url)
 
-    print("************* ========= *************")
-    await page.wait_for_timeout(10000)
-    print("************* ========= *************")
+        if "#/login" in page.url:
+            return False, "Session expired or invalid"
 
-    while True:
-        result, reason = await click_next_pagination(page)
-        print("click_next_pagination:", result, reason)
+        print("************* ========= *************")
+        await page.wait_for_timeout(10000)
+        print("************* ========= *************")
 
-        if result:
-            break
+        while True:
+            result, reason = await click_next_pagination(page)
+            print("click_next_pagination:", result, reason)
 
-        await asyncio.sleep(random.randint(4, 8))
+            if result:
+                break
 
-    await page.screenshot(path="apollo_people_page_after_next.png", full_page=True)
-    print("Saved: apollo_people_page_after_next.png")
+            await asyncio.sleep(random.randint(4, 8))
 
-    print("Old logic finished.")
-    return True, "OK"
+        await end_company(company_id)
+        print(f"Set modified_time for company_id={company_id}")
+
+        await page.screenshot(path="apollo_people_page_after_next.png", full_page=True)
+        print("Saved: apollo_people_page_after_next.png")
+
+        print("Old logic finished.")
+        return True, "OK"
+    finally:
+        ctx["current_company_id"] = None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Apollo web scraper with backend API integration")
+    parser.add_argument(
+        "--sources",
+        type=str,
+        default=os.environ.get("SOURCES", ""),
+        help="Comma-separated source values to filter companies (optional)",
+    )
+    return parser.parse_args()
 
 
 async def main():
+    args = parse_args()
     if not Path(STATE_FILE).exists():
         raise FileNotFoundError(f"{STATE_FILE} not found. Run save_apollo_state.py first.")
 
     request_logs = []
     response_logs = []
-
-    # Put your search targets here
-    targets = [
-        {"company_domain": "empirefoods.com", "company_name": "Empire Marketing Strategies"},
-        {"company_domain": "ethosrisk.com", "company_name": "Ethos"},
-    ]
+    ctx = {"current_company_id": None}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -466,18 +519,14 @@ async def main():
                 }
                 request_logs.append(entry)
 
-                print("\n" + "=" * 100)
-                print("REQUEST")
-                print("=" * 100)
-                print("METHOD:", request.method)
-                print("URL   :", request.url)
-                print("TYPE  :", request.resource_type)
-                print("HEADERS:")
-                print(json.dumps(headers, indent=2, ensure_ascii=False))
-
-                if post_data:
-                    print("POST DATA:")
-                    print(post_data[:3000])
+                if DEBUG_LOG_RESPONSES:
+                    print("\n" + "=" * 100)
+                    print("REQUEST")
+                    print("=" * 100)
+                    print("METHOD:", request.method)
+                    print("URL   :", request.url)
+                    if post_data:
+                        print("POST DATA:", post_data[:3000])
 
             except Exception as e:
                 print("handle_request error:", e)
@@ -488,36 +537,42 @@ async def main():
                 if not is_interesting_request(response.url, request.resource_type):
                     return
 
-                headers = await response.all_headers()
-
                 try:
                     body_text = await response.text()
                 except Exception:
                     body_text = "<could not decode response body>"
 
-                entry = {
-                    "url": response.url,
-                    "status": response.status,
-                    "status_text": response.status_text,
-                    "resource_type": request.resource_type,
-                    "request_method": request.method,
-                    "headers": headers,
-                    "body_text": body_text[:10000] if body_text else None,
-                }
-                response_logs.append(entry)
+                if DEBUG_LOG_RESPONSES:
+                    response_logs.append({
+                        "url": response.url,
+                        "status": response.status,
+                        "body_text": body_text[:10000] if body_text else None,
+                    })
+                    print("\n" + "=" * 100)
+                    print("RESPONSE", response.status, response.url)
+                    if body_text:
+                        print("BODY:", body_text[:3000])
 
-                print("\n" + "=" * 100)
-                print("RESPONSE")
-                print("=" * 100)
-                print("STATUS:", response.status, response.status_text)
-                print("URL   :", response.url)
-                print("TYPE  :", request.resource_type)
-                print("HEADERS:")
-                print(json.dumps(headers, indent=2, ensure_ascii=False))
+                company_id = ctx.get("current_company_id")
+                if company_id is None:
+                    return
 
-                if body_text:
-                    print("BODY:")
-                    print(body_text[:3000])
+                try:
+                    data = json.loads(body_text)
+                except json.JSONDecodeError:
+                    return
+
+                people = data.get("people", [])
+                if not people:
+                    return
+
+                try:
+                    result = await save_apollo_page(company_id, body_text)
+                    inserted = result.get("inserted", 0)
+                    skipped = result.get("skipped", 0)
+                    print(f"[Backend] Saved page for company_id={company_id}: inserted={inserted}, skipped={skipped}")
+                except Exception as e:
+                    print(f"[Backend] Failed to save page for company_id={company_id}: {e}")
 
             except Exception as e:
                 print("handle_response error:", e)
@@ -542,59 +597,79 @@ async def main():
 
         await page.wait_for_timeout(5000)
 
-        for idx, target in enumerate(targets, start=1):
-            raw_domain = target.get("company_domain", "")
-            raw_name = target.get("company_name", "")
-
-            company_domain = extract_domain_from_url(raw_domain)
-            company_name = raw_name.strip() if raw_name else None
-
-            print("\n" + "#" * 120)
-            print(f"TARGET {idx}")
-            print(f"company_domain = {company_domain}")
-            print(f"company_name   = {company_name}")
-            print("#" * 120)
-
-            while True:
-                result, reason, company_url = await search_company_on_searchtag(
-                    page,
-                    company_domain=company_domain,
-                    company_name=company_name
-                )
-
-                print("search_company_on_searchtag:", result, reason, company_url)
-                
-                if not result and reason == "Search input not found":
-                    page.wait_for_timeout(2000)
-                else:
-                    break
-
-            if not result:
-                print(f"No matching company found for {company_domain}. Skipping.")
-                continue
-
-            people_url = build_people_url_from_company_url(company_url or page.url)
-            print("Derived people URL:", people_url)
-
-            if not people_url:
-                print("Could not derive people URL from company page. Skipping.")
-                continue
-
-            ok, msg = await open_people_page_and_run_old_logic(page, people_url)
-            print("open_people_page_and_run_old_logic:", ok, msg)
-
-            # Go back home before next company search
-            print("Returning to home page for next target...")
-            await page.goto(HOME_URL, wait_until="domcontentloaded")
+        batch_num = 0
+        while True:
             try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
-            except PlaywrightTimeoutError:
-                print("networkidle timeout when returning home; continuing")
+                records = await fetch_companies(args.sources or None)
+            except Exception as e:
+                print(f"Failed to fetch companies from backend: {e}")
+                break
 
-            await page.wait_for_timeout(3000)
+            if not records:
+                print("No more companies to process.")
+                break
 
-        await dump_json(REQUEST_LOG_FILE, request_logs)
-        await dump_json(RESPONSE_LOG_FILE, response_logs)
+            batch_num += 1
+            print(f"\nBatch {batch_num}: fetched {len(records)} companies")
+
+            for idx, rec in enumerate(records, start=1):
+                company_id = rec.get("id")
+                website = rec.get("website", "")
+                name = rec.get("name", "")
+
+                company_domain = extract_domain_from_url(website)
+                company_name = name.strip() if name else None
+
+                print("\n" + "#" * 120)
+                print(f"TARGET {idx} (company_id={company_id})")
+                print(f"company_domain = {company_domain}")
+                print(f"company_name   = {company_name}")
+                print("#" * 120)
+
+                while True:
+                    result, reason, company_url = await search_company_on_searchtag(
+                        page,
+                        company_domain=company_domain,
+                        company_name=company_name
+                    )
+
+                    print("search_company_on_searchtag:", result, reason, company_url)
+
+                    if not result and reason == "Search input not found":
+                        await page.wait_for_timeout(2000)
+                    else:
+                        break
+
+                if not result:
+                    print(f"No matching company found for {company_domain}. Skipping.")
+                    continue
+
+                people_url = build_people_url_from_company_url(company_url or page.url)
+                print("Derived people URL:", people_url)
+
+                if not people_url:
+                    print("Could not derive people URL from company page. Skipping.")
+                    continue
+
+                ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
+                print("open_people_page_and_run_old_logic:", ok, msg)
+
+                if not ok:
+                    print(f"People page failed for company_id={company_id}: {msg}")
+
+                # Go back home before next company search
+                print("Returning to home page for next target...")
+                await page.goto(HOME_URL, wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except PlaywrightTimeoutError:
+                    print("networkidle timeout when returning home; continuing")
+
+                await page.wait_for_timeout(3000)
+
+        if DEBUG_LOG_RESPONSES:
+            await dump_json(REQUEST_LOG_FILE, request_logs)
+            await dump_json(RESPONSE_LOG_FILE, response_logs)
 
         print("All done.")
         await page.pause()
