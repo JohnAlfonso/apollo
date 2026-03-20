@@ -131,19 +131,32 @@ async def is_cloudflare_blocked(page) -> bool:
     """Return True if the current page is a Cloudflare challenge/block page."""
     try:
         title = (await page.title()).lower()
-        if any(x in title for x in ["just a moment", "attention required", "checking your", "please wait"]):
+        if any(x in title for x in [
+            "just a moment", "attention required", "checking your",
+            "please wait", "verify you are human",
+        ]):
             return True
     except Exception:
         pass
 
     for selector in [
+        # Classic JS challenge
         "#challenge-form",
         "#challenge-running",
         "[data-ray]",
+        # Turnstile iframe (any path under challenges.cloudflare.com)
         "iframe[src*='challenges.cloudflare.com']",
+        # Turnstile container element (rendered before iframe appears)
+        ".cf-turnstile",
+        "[class*='cf-turnstile']",
+        "[data-sitekey]",
+        # Full-page Turnstile wrapper
+        "#cf-turnstile",
     ]:
         try:
-            if await page.locator(selector).count() > 0:
+            loc = page.locator(selector)
+            if await loc.count() > 0 and await loc.first.is_visible():
+                print(f"Cloudflare indicator detected: {selector}")
                 return True
         except Exception:
             pass
