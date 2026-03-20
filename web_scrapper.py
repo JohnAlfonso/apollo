@@ -91,6 +91,40 @@ async def dump_json(path: str, data):
         print(f"Failed to save {path}: {e}")
 
 
+# ─────────────────────── human-like behaviour helpers ───────────────────────
+
+async def human_mouse_move(page):
+    """Move the mouse to a random position on the viewport in natural steps."""
+    vp = page.viewport_size or {"width": 1440, "height": 900}
+    x = random.randint(80, vp["width"] - 80)
+    y = random.randint(80, vp["height"] - 80)
+    await page.mouse.move(x, y, steps=random.randint(8, 20))
+    await page.wait_for_timeout(random.randint(50, 180))
+
+
+async def human_scroll(page, direction: str = "down"):
+    """Scroll the page in small natural increments like a real user would."""
+    total = random.randint(150, 500) * (1 if direction == "down" else -1)
+    steps = random.randint(3, 7)
+    delta = total // steps
+    for _ in range(steps):
+        await page.mouse.wheel(0, delta)
+        await page.wait_for_timeout(random.randint(60, 180))
+
+
+async def human_idle(page, min_ms: int = 1500, max_ms: int = 4000):
+    """Simulate an idle human: move mouse and randomly scroll while waiting."""
+    end_time = asyncio.get_event_loop().time() + random.uniform(min_ms / 1000, max_ms / 1000)
+    while asyncio.get_event_loop().time() < end_time:
+        action = random.choice(["move", "move", "scroll", "pause"])
+        if action == "move":
+            await human_mouse_move(page)
+        elif action == "scroll":
+            await human_scroll(page, direction=random.choice(["down", "down", "up"]))
+        else:
+            await page.wait_for_timeout(random.randint(300, 800))
+
+
 async def fetch_companies(sources: str | None = None) -> list[dict]:
     """Fetch companies from backend API (company_check=1, modified_time IS NULL)."""
     url = f"{BACKEND_API_URL}/api/data-apollo/companies"
@@ -161,23 +195,26 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 
     # 2) Focus and clear old text
     try:
+        await human_mouse_move(page)
+        await search_input.hover()
+        await page.wait_for_timeout(random.randint(200, 450))
         await search_input.click()
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(random.randint(200, 400))
 
         await search_input.fill("")
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(random.randint(150, 300))
 
         await search_input.click()
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Backspace")
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(random.randint(200, 400))
     except Exception as e:
         return False, f"Could not clear search input: {e}", None
 
-    # 3) Type target domain
+    # 3) Type target domain with natural per-character delay
     try:
-        await search_input.type(target_domain, delay=random.randint(60, 120))
-        await page.wait_for_timeout(2500)
+        await search_input.type(target_domain, delay=random.randint(80, 150))
+        await page.wait_for_timeout(random.randint(2000, 3000))
     except Exception as e:
         return False, f"Could not type search term: {e}", None
 
@@ -325,12 +362,17 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     clicked = False
 
     try:
+        await human_mouse_move(page)
+        await selected["locator"].hover()
+        await page.wait_for_timeout(random.randint(250, 600))
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
             await selected["locator"].click()
         clicked = True
     except Exception:
         # Apollo is SPA-heavy. Normal navigation often won't fire.
         try:
+            await selected["locator"].hover()
+            await page.wait_for_timeout(random.randint(150, 350))
             await selected["locator"].click()
             clicked = True
         except Exception as e:
@@ -409,6 +451,9 @@ async def click_next_pagination(page):
     print("Clicking Next...")
 
     try:
+        await human_mouse_move(page)
+        await next_button.hover()
+        await page.wait_for_timeout(random.randint(300, 700))
         async with page.expect_response(
             lambda r: "api/v1/mixed_people/search" in r.url.lower(),
             timeout=20000
@@ -459,7 +504,8 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             return False, "Session expired or invalid"
 
         print("************* ========= *************")
-        await page.wait_for_timeout(10000)
+        # Simulate idle human behaviour while the page loads
+        await human_idle(page, min_ms=8000, max_ms=12000)
         print("************* ========= *************")
 
         while True:
@@ -610,7 +656,7 @@ async def main():
             await browser.close()
             return
 
-        await page.wait_for_timeout(5000)
+        await human_idle(page, min_ms=4000, max_ms=7000)
 
         batch_num = 0
         while True:
@@ -690,7 +736,7 @@ async def main():
                 except PlaywrightTimeoutError:
                     print("networkidle timeout when returning home; continuing")
 
-                await page.wait_for_timeout(3000)
+                await human_idle(page, min_ms=2000, max_ms=4000)
 
         if DEBUG_LOG_RESPONSES:
             await dump_json(REQUEST_LOG_FILE, request_logs)
