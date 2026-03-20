@@ -207,34 +207,88 @@ async def wait_for_cloudflare(page, max_wait_ms: int = 30000) -> bool:
     return False
 
 
-async def handle_cloudflare(page) -> bool:
+async def wait_for_manual_cf_solve(page, poll_interval_ms: int = 3000) -> bool:
+    """Poll indefinitely until the user solves the Cloudflare Turnstile challenge.
+
+    Unlike page.pause() this does NOT require the Playwright inspector to be open.
+    The scraper simply idles until the challenge widget disappears from the DOM.
+    """
+    print("\n" + "=" * 70)
+    print("ACTION REQUIRED: Solve the Cloudflare 'Verify you are human' checkbox")
+    print("in the browser window. The scraper will resume automatically.")
+    print("=" * 70)
+
+    attempt = 0
+    while True:
+        await page.wait_for_timeout(poll_interval_ms)
+        attempt += 1
+        if not await is_cloudflare_blocked(page):
+            print(f"Cloudflare challenge solved by user after ~{attempt * poll_interval_ms // 1000}s.")
+            return True
+        if attempt % 10 == 0:
+            elapsed = attempt * poll_interval_ms // 1000
+            print(f"Still waiting for Cloudflare solve... ({elapsed}s elapsed). Please check the browser.")
+
+
+async def handle_cloudflare(page, ctx: dict | None = None) -> bool:
     """
     Full Cloudflare handling flow:
       1. Not blocked          -> return True immediately
       2. JS challenge         -> wait up to 30s for auto-resolve
-      3. Turnstile/hard block -> pause and let user solve manually
-      4. Still blocked        -> return False (caller should skip the company)
+      3. Turnstile/hard block -> poll until user solves manually
+      4. Record solve time in ctx so proactive timer can reset
     """
     if not await is_cloudflare_blocked(page):
         return True
 
     print("WARNING: Cloudflare challenge detected!")
 
-    # Step 1 – try auto-resolve (JS challenge)
-    if await wait_for_cloudflare(page, max_wait_ms=30000):
+    # Step 1 – try auto-resolve (JS challenge, usually resolves in <10s)
+    if await wait_for_cloudflare(page, max_wait_ms=15000):
+        if ctx is not None:
+            ctx["last_cf_solved_at"] = time.time()
         return True
 
-    # Step 2 – interactive challenge (Turnstile): hand over to user
-    print("WARNING: Manual solving required. Complete the challenge in the browser window.")
-    await page.pause()  # opens Playwright inspector so user can intervene
-    await page.wait_for_timeout(2000)
-
-    if not await is_cloudflare_blocked(page):
-        print("Cloudflare challenge solved manually.")
+    # Step 2 – Turnstile / interactive challenge: poll until user clicks checkbox
+    solved = await wait_for_manual_cf_solve(page)
+    if solved:
+        if ctx is not None:
+            ctx["last_cf_solved_at"] = time.time()
+        print("Cloudflare challenge solved manually. Resuming...")
+        await page.wait_for_timeout(2000)
         return True
 
+    # Should never reach here (wait_for_manual_cf_solve loops forever)
     print("Could not pass Cloudflare challenge. Skipping this target.")
     return False
+
+
+async def proactive_cf_check(page, ctx: dict, threshold_minutes: int = 55) -> None:
+    """Proactively trigger a Cloudflare check when approaching the ~1hr reset window.
+
+    Apollo's Cloudflare Turnstile fires roughly every 60 minutes. By checking at
+    55 minutes we catch it before it interrupts active scraping mid-company.
+    """
+    last_solved = ctx.get("last_cf_solved_at")
+    if last_solved is None:
+        return  # No previous solve recorded yet
+
+    elapsed_minutes = (time.time() - last_solved) / 60
+    if elapsed_minutes < threshold_minutes:
+        return  # Still well within the safe window
+
+    print(f"\n[CF Timer] {elapsed_minutes:.1f} min elapsed since last Cloudflare solve "
+          f"(threshold={threshold_minutes} min). Performing proactive check...")
+
+    # Navigate to home to trigger the challenge in a safe, predictable place
+    await page.goto(HOME_URL, wait_until="domcontentloaded")
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except PlaywrightTimeoutError:
+        pass
+
+    await handle_cloudflare(page, ctx)
+    print("[CF Timer] Proactive check complete. Continuing scraping...")
 
 
 async def fetch_companies(sources: str | None = None) -> list[dict]:
@@ -665,7 +719,10 @@ async def main():
 
     request_logs = []
     response_logs = []
-    ctx = {"current_company_id": None}
+    ctx = {
+        "current_company_id": None,
+        "last_cf_solved_at": time.time(),  # treat startup as a fresh solve
+    }
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -774,7 +831,7 @@ async def main():
             await browser.close()
             return
 
-        if not await handle_cloudflare(page):
+        if not await handle_cloudflare(page, ctx):
             print("Cloudflare blocked home page. Aborting.")
             await browser.close()
             return
@@ -797,6 +854,8 @@ async def main():
             print(f"\nBatch {batch_num}: fetched {len(records)} companies")
 
             for idx, rec in enumerate(records, start=1):
+                # Proactive Cloudflare check — fires at ~55 min to beat the 60-min wall
+                await proactive_cf_check(page, ctx, threshold_minutes=55)
                 company_id = rec.get("id")
                 website = rec.get("website", "")
                 name = rec.get("name", "")
@@ -813,7 +872,7 @@ async def main():
                 print("#" * 120)
 
                 # Check for Cloudflare before attempting to search
-                if not await handle_cloudflare(page):
+                if not await handle_cloudflare(page, ctx):
                     print(f"Cloudflare blocked search for company_id={company_id}. Skipping.")
                     try:
                         await end_company(company_id)
@@ -855,7 +914,7 @@ async def main():
                     continue
 
                 # Check for Cloudflare before opening people page
-                if not await handle_cloudflare(page):
+                if not await handle_cloudflare(page, ctx):
                     print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
                     try:
                         await end_company(company_id)
@@ -877,7 +936,7 @@ async def main():
                 except PlaywrightTimeoutError:
                     print("networkidle timeout when returning home; continuing")
 
-                await handle_cloudflare(page)
+                await handle_cloudflare(page, ctx)
                 await human_idle(page, min_ms=2000, max_ms=4000)
 
         if DEBUG_LOG_RESPONSES:
