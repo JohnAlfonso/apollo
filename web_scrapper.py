@@ -586,7 +586,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             if "not found" in reason.lower() or "disabled" in reason.lower():
                 break
 
-            await asyncio.sleep(random.randint(4, 8))
+            await asyncio.sleep(random.randint(6, 10))
 
         await end_company(company_id)
         print(f"Set modified_time for company_id={company_id}")
@@ -821,7 +821,7 @@ async def main():
 
                 if not ok:
                     print(f"People page failed for company_id={company_id}: {msg}")
-
+                await asyncio.sleep(random.randint(8, 15))
                 # Go back home before next company search
                 print("Returning to home page for next target...")
                 await page.goto(HOME_URL, wait_until="domcontentloaded")
