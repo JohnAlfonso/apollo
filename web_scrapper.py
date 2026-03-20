@@ -93,27 +93,55 @@ async def dump_json(path: str, data):
 
 # ─────────────────────── human-like behaviour helpers ───────────────────────
 
-async def human_mouse_move(page):
-    """Move the mouse to a random position on the viewport in natural steps."""
+async def human_mouse_move(page, target_x: int | None = None, target_y: int | None = None):
+    """Move the mouse slowly along a curved path, like a real human hand."""
     vp = page.viewport_size or {"width": 1440, "height": 900}
-    x = random.randint(80, vp["width"] - 80)
-    y = random.randint(80, vp["height"] - 80)
-    await page.mouse.move(x, y, steps=random.randint(8, 20))
-    await page.wait_for_timeout(random.randint(50, 180))
+
+    # Destination — random if not specified
+    end_x = target_x if target_x is not None else random.randint(80, vp["width"] - 80)
+    end_y = target_y if target_y is not None else random.randint(80, vp["height"] - 80)
+
+    # Use many fine steps with a per-step delay so movement is visibly slow
+    steps = random.randint(30, 60)
+
+    # Bézier control point: offset the midpoint randomly to curve the path
+    mid_x = (end_x) / 2 + random.randint(-120, 120)
+    mid_y = (end_y) / 2 + random.randint(-120, 120)
+
+    prev_x, prev_y = None, None
+    for i in range(1, steps + 1):
+        t = i / steps
+        # Quadratic Bézier interpolation
+        bx = int((1 - t) ** 2 * 0 + 2 * (1 - t) * t * mid_x + t ** 2 * end_x)
+        by = int((1 - t) ** 2 * 0 + 2 * (1 - t) * t * mid_y + t ** 2 * end_y)
+
+        # Skip duplicate points to avoid redundant Playwright calls
+        if bx == prev_x and by == prev_y:
+            continue
+        prev_x, prev_y = bx, by
+
+        await page.mouse.move(bx, by)
+        # Variable per-step delay: slower at start/end, faster in middle (ease-in-out feel)
+        ease = 1 - abs(2 * t - 1)  # 0→1→0
+        step_delay = int(random.randint(8, 18) + ease * random.randint(10, 25))
+        await page.wait_for_timeout(step_delay)
+
+    # Short pause after arriving, like a human settling the cursor
+    await page.wait_for_timeout(random.randint(80, 250))
 
 
 async def human_scroll(page, direction: str = "down"):
     """Scroll the page in small natural increments like a real user would."""
     total = random.randint(150, 500) * (1 if direction == "down" else -1)
-    steps = random.randint(3, 7)
+    steps = random.randint(5, 10)
     delta = total // steps
     for _ in range(steps):
         await page.mouse.wheel(0, delta)
-        await page.wait_for_timeout(random.randint(60, 180))
+        await page.wait_for_timeout(random.randint(80, 220))
 
 
 async def human_idle(page, min_ms: int = 1500, max_ms: int = 4000):
-    """Simulate an idle human: move mouse and randomly scroll while waiting."""
+    """Simulate an idle human: move mouse slowly and randomly scroll while waiting."""
     end_time = asyncio.get_event_loop().time() + random.uniform(min_ms / 1000, max_ms / 1000)
     while asyncio.get_event_loop().time() < end_time:
         action = random.choice(["move", "move", "scroll", "pause"])
@@ -122,7 +150,7 @@ async def human_idle(page, min_ms: int = 1500, max_ms: int = 4000):
         elif action == "scroll":
             await human_scroll(page, direction=random.choice(["down", "down", "up"]))
         else:
-            await page.wait_for_timeout(random.randint(300, 800))
+            await page.wait_for_timeout(random.randint(400, 1000))
 
 
 # ─────────────────────── cloudflare detection & handling ───────────────────
