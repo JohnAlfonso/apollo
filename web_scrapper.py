@@ -125,6 +125,77 @@ async def human_idle(page, min_ms: int = 1500, max_ms: int = 4000):
             await page.wait_for_timeout(random.randint(300, 800))
 
 
+# ─────────────────────── cloudflare detection & handling ───────────────────
+
+async def is_cloudflare_blocked(page) -> bool:
+    """Return True if the current page is a Cloudflare challenge/block page."""
+    try:
+        title = (await page.title()).lower()
+        if any(x in title for x in ["just a moment", "attention required", "checking your", "please wait"]):
+            return True
+    except Exception:
+        pass
+
+    for selector in [
+        "#challenge-form",
+        "#challenge-running",
+        "[data-ray]",
+        "iframe[src*='challenges.cloudflare.com']",
+    ]:
+        try:
+            if await page.locator(selector).count() > 0:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+async def wait_for_cloudflare(page, max_wait_ms: int = 30000) -> bool:
+    """Wait for a JS-auto-solving Cloudflare challenge to resolve on its own."""
+    step = 2000
+    waited = 0
+    while waited < max_wait_ms:
+        if not await is_cloudflare_blocked(page):
+            print("Cloudflare challenge passed automatically.")
+            return True
+        print(f"Cloudflare challenge active, waiting... ({waited}ms elapsed)")
+        await human_idle(page, min_ms=step, max_ms=step + 500)
+        waited += step
+    print("Cloudflare challenge did NOT resolve automatically.")
+    return False
+
+
+async def handle_cloudflare(page) -> bool:
+    """
+    Full Cloudflare handling flow:
+      1. Not blocked          -> return True immediately
+      2. JS challenge         -> wait up to 30s for auto-resolve
+      3. Turnstile/hard block -> pause and let user solve manually
+      4. Still blocked        -> return False (caller should skip the company)
+    """
+    if not await is_cloudflare_blocked(page):
+        return True
+
+    print("WARNING: Cloudflare challenge detected!")
+
+    # Step 1 – try auto-resolve (JS challenge)
+    if await wait_for_cloudflare(page, max_wait_ms=30000):
+        return True
+
+    # Step 2 – interactive challenge (Turnstile): hand over to user
+    print("WARNING: Manual solving required. Complete the challenge in the browser window.")
+    await page.pause()  # opens Playwright inspector so user can intervene
+    await page.wait_for_timeout(2000)
+
+    if not await is_cloudflare_blocked(page):
+        print("Cloudflare challenge solved manually.")
+        return True
+
+    print("Could not pass Cloudflare challenge. Skipping this target.")
+    return False
+
+
 async def fetch_companies(sources: str | None = None) -> list[dict]:
     """Fetch companies from backend API (company_check=1, modified_time IS NULL)."""
     url = f"{BACKEND_API_URL}/api/data-apollo/companies"
@@ -656,6 +727,11 @@ async def main():
             await browser.close()
             return
 
+        if not await handle_cloudflare(page):
+            print("Cloudflare blocked home page. Aborting.")
+            await browser.close()
+            return
+
         await human_idle(page, min_ms=4000, max_ms=7000)
 
         batch_num = 0
@@ -688,6 +764,15 @@ async def main():
                 print(f"company_name   = {company_name}")
                 print(f"company_source = {company_source}")
                 print("#" * 120)
+
+                # Check for Cloudflare before attempting to search
+                if not await handle_cloudflare(page):
+                    print(f"Cloudflare blocked search for company_id={company_id}. Skipping.")
+                    try:
+                        await end_company(company_id)
+                    except Exception as e:
+                        print(f"Failed to mark company_id={company_id}: {e}")
+                    continue
 
                 while True:
                     result, reason, company_url = await search_company_on_searchtag(
@@ -722,6 +807,15 @@ async def main():
                         print(f"Failed to mark company_id={company_id}: {e}")
                     continue
 
+                # Check for Cloudflare before opening people page
+                if not await handle_cloudflare(page):
+                    print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
+                    try:
+                        await end_company(company_id)
+                    except Exception as e:
+                        print(f"Failed to mark company_id={company_id}: {e}")
+                    continue
+
                 ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
                 print("open_people_page_and_run_old_logic:", ok, msg)
 
@@ -736,6 +830,7 @@ async def main():
                 except PlaywrightTimeoutError:
                     print("networkidle timeout when returning home; continuing")
 
+                await handle_cloudflare(page)
                 await human_idle(page, min_ms=2000, max_ms=4000)
 
         if DEBUG_LOG_RESPONSES:
