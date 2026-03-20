@@ -6,7 +6,7 @@ import random
 import re
 from pathlib import Path
 from urllib.parse import urlparse
-
+import time
 import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -633,7 +633,7 @@ async def main():
         )
 
         page = await context.new_page()
-
+        time.sleep(30)
         async def handle_request(request):
             try:
                 if not is_interesting_request(request.url, request.resource_type):
