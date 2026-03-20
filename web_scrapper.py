@@ -328,6 +328,10 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                         if len(norm_text) < 3:
                             continue
 
+                        # Reject container elements — individual dropdown rows are short
+                        if len(norm_text) > 300:
+                            continue
+
                         href = (await row.get_attribute("href")) or ""
 
                         # Reject generic category links (e.g. #/companies) - not company org pages
@@ -337,12 +341,14 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 
                         # Keep only rows that look like actual company search results
                         has_domain = target_domain in norm_text
-                        has_name = target_name and target_name in norm_text
+                        # has_name alone is sufficient: Apollo dropdown shows company name, not domain;
+                        # sidebar nav items ("People", "Companies") won't contain the target company name
+                        has_name = bool(target_name and target_name in norm_text)
                         has_org_link = "/organizations/" in href or "#/organizations/" in href
 
                         looks_relevant = (
                             has_domain
-                            or (has_name or has_org_link)
+                            or has_name
                             or (has_org_link and ("companies" in norm_text or target_domain in norm_text))
                         )
 
