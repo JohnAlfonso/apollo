@@ -5,7 +5,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 LOGIN_URL = "https://app.apollo.io/#/login?redirectTo=https%3A%2F%2Fapp.apollo.io%2F%23%2Fhome"
 STATE_FILE = "apollo_state.json"
 
-EMAIL = "rr@lgame.site"
+EMAIL = "Neuron@lgame.space"
 PASSWORD = "123qwe!@#QWE"
 
 
