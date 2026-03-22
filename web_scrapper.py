@@ -79,7 +79,7 @@ def build_people_url_from_company_url(company_url: str) -> str | None:
     return (
         f"https://app.apollo.io/#/organizations/{org_id}/people/"
         f"?page=1&sortByField=recommendations_score&sortAscending=false"
-        f"&personLocations[]=United%20States"
+        f"&personLocations[]=United%20States&contactEmailStatusV2[]=verified"
     )
 
 
