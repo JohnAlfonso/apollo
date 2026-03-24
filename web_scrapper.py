@@ -83,7 +83,7 @@ def build_people_url_from_company_url(company_url: str) -> str | None:
     return (
         f"https://app.apollo.io/#/organizations/{org_id}/people/"
         f"?page=1&sortByField=recommendations_score&sortAscending=false"
-        f"&personLocations[]=United%20States&contactEmailStatusV2[]=verified"
+        f"&personLocations[]=United%20States"
     )
 
 
@@ -1083,7 +1083,7 @@ async def main():
                         people_url = (
                             f"https://app.apollo.io/#/organizations/{apollo_org_id}/people/"
                             f"?page=1&sortByField=recommendations_score&sortAscending=false"
-                            f"&personLocations[]=United%20States&contactEmailStatusV2[]=verified"
+                            f"&personLocations[]=United%20States"
                         )
                         print(f"[new_person] Apollo fast-path: org_id={apollo_org_id}, people_url={people_url}")
 
