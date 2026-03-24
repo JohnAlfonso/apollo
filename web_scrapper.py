@@ -18,6 +18,8 @@ RESPONSE_LOG_FILE = "apollo_responses.json"
 
 BACKEND_API_URL = os.environ.get("BACKEND_API_URL", "http://95.217.116.91:9900")
 DEBUG_LOG_RESPONSES = os.environ.get("APOLLO_DEBUG_LOG", "").lower() in ("1", "true", "yes")
+# Set APOLLO_DISCOVER_ENDPOINTS=1 to log ALL Apollo API calls and discover the company info endpoint
+DISCOVER_ENDPOINTS = os.environ.get("APOLLO_DISCOVER_ENDPOINTS", "").lower() in ("1", "true", "yes")
 
 
 def is_interesting_request(url: str, resource_type: str) -> bool:
@@ -26,6 +28,8 @@ def is_interesting_request(url: str, resource_type: str) -> bool:
         "apollo.io" in url_l
         and (
             "api/v1/mixed_people/search" in url_l
+            or "api/v1/organizations/" in url_l
+            or "api/v1/mixed_companies/search" in url_l
         )
     )
 
@@ -81,6 +85,133 @@ def build_people_url_from_company_url(company_url: str) -> str | None:
         f"?page=1&sortByField=recommendations_score&sortAscending=false"
         f"&personLocations[]=United%20States&contactEmailStatusV2[]=verified"
     )
+
+
+_COUNTRY_TO_CODE: dict[str, str] = {
+    "united states": "US", "united kingdom": "GB", "canada": "CA",
+    "australia": "AU", "germany": "DE", "france": "FR", "india": "IN",
+    "china": "CN", "japan": "JP", "brazil": "BR", "mexico": "MX",
+    "spain": "ES", "italy": "IT", "netherlands": "NL", "sweden": "SE",
+    "norway": "NO", "denmark": "DK", "finland": "FI", "switzerland": "CH",
+    "austria": "AT", "belgium": "BE", "portugal": "PT", "poland": "PL",
+    "singapore": "SG", "new zealand": "NZ", "south africa": "ZA",
+    "israel": "IL", "ireland": "IE", "south korea": "KR", "taiwan": "TW",
+}
+
+
+def _linkedin_slug(url: str) -> str:
+    """Extract the company slug from a LinkedIn URL, or return the value as-is."""
+    if not url:
+        return ""
+    return url.rstrip("/").split("/")[-1]
+
+
+def _build_location(org: dict) -> str:
+    """Build a consistently formatted address string from Apollo's individual address fields."""
+    parts = [
+        org.get("street_address") or "",
+        org.get("city") or "",
+        org.get("state") or "",
+        org.get("postal_code") or "",
+        org.get("country") or "",
+    ]
+    return ", ".join(p for p in parts if p.strip())
+
+
+def _build_company_payload(org: dict, company_id: int | None) -> dict:
+    """Map an Apollo organization dict to the standard company info template."""
+    country = (org.get("country") or "").strip()
+    return {
+        "domain":         org.get("primary_domain") or extract_domain_from_url(org.get("website_url") or ""),
+        "source":         "apollo",
+        "founded":        org.get("founded_year"),
+        "website":        org.get("website_url") or "",
+        "industry":       org.get("industry") or "",
+        "location":       _build_location(org),
+        "city":           org.get("city") or "",
+        "state":          org.get("state") or "",
+        "country":        org.get("country") or "",
+        "companyId":      org.get("id") or "",
+        "companyName":    org.get("name") or "",
+        "companyType":    "",
+        "countryCode":    _COUNTRY_TO_CODE.get(country.lower(), ""),
+        "description":    org.get("short_description") or "",
+        "linkedin_url":   _linkedin_slug(org.get("linkedin_url") or ""),
+        "employeesCount": org.get("estimated_num_employees") or 0,
+    }
+
+
+async def save_company_info(company_id: int, payload: dict) -> dict | None:
+    """POST company info payload to backend."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/company-info"
+    body = {"company_id": company_id, **payload}
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(url, json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def fetch_company_from_queue() -> dict | None:
+    """Fetch next company for get_company mode (FOR UPDATE SKIP LOCKED, sets flag3='1')."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/company-queue"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.json().get("record")
+
+
+async def end_company_queue(company_id: int) -> None:
+    """Mark a get_company-queue record as done (flag3='2')."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/company-queue/{company_id}/end"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
+
+
+async def fetch_new_person_company() -> dict | None:
+    """Fetch next company for new_person mode (FOR UPDATE SKIP LOCKED, sets flag1=-1)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/new-person-queue"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.json().get("record")
+
+
+async def end_new_person_company(company_id: int, success: bool) -> None:
+    """Set flag1=1 (success) or flag1=0 (fail) for a new_person company."""
+    state = "success" if success else "fail"
+    url = f"{BACKEND_API_URL}/api/data-apollo/new-person-queue/{company_id}/{state}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
+
+
+async def log_company_info(body_text: str, company_id: int | None) -> None:
+    """Parse Apollo org response, map to company template, print and save to backend."""
+    try:
+        data = json.loads(body_text)
+    except json.JSONDecodeError:
+        return
+
+    # Apollo returns either {"organization": {...}} or {"organizations": [...]}
+    org = data.get("organization") or (data.get("organizations") or [None])[0]
+    if not org:
+        return
+
+    payload = _build_company_payload(org, company_id)
+
+    print("\n" + "=" * 80)
+    print(f"[COMPANY INFO] company_id={company_id}")
+    print("=" * 80)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print("=" * 80)
+
+    try:
+        result = await save_company_info(company_id, payload)
+        print(f"[Backend] Saved company info for company_id={company_id}: {result}")
+    except Exception as e:
+        print(f"[Backend] Failed to save company info for company_id={company_id}: {e}")
+
 
 
 async def dump_json(path: str, data):
@@ -689,8 +820,12 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
 
             await asyncio.sleep(random.randint(6, 10))
 
-        await end_company(company_id)
-        print(f"Set modified_time for company_id={company_id}")
+        if ctx.get("mode") == "new_person":
+            await end_new_person_company(company_id, True)
+            print(f"[new_person] Set flag1=1 (success) for company_id={company_id}")
+        else:
+            await end_company(company_id)
+            print(f"Set modified_time for company_id={company_id}")
 
         await page.screenshot(path="apollo_people_page_after_next.png", full_page=True)
         print("Saved: apollo_people_page_after_next.png")
@@ -709,6 +844,16 @@ def parse_args():
         default=os.environ.get("SOURCES", "hunter.io-50-1000"),
         help="Comma-separated source values to filter companies (optional)",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["add_person", "get_company", "new_person"],
+        default=os.environ.get("SCRAPER_MODE", "add_person"),
+        help=(
+            "add_person : navigate to each company's people page and scrape contacts (default). "
+            "get_company: capture company profile info only (name, phone, industry, address, etc.)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -722,6 +867,8 @@ async def main():
     ctx = {
         "current_company_id": None,
         "last_cf_solved_at": time.time(),  # treat startup as a fresh solve
+        "mode": args.mode,
+        "company_info_logged": set(),       # tracks company_ids already logged in get_company mode
     }
 
     async with async_playwright() as p:
@@ -770,6 +917,20 @@ async def main():
         async def handle_response(response):
             try:
                 request = response.request
+
+                # ── Discovery mode: log every Apollo API call to find new endpoints ──
+                if DISCOVER_ENDPOINTS and "apollo.io" in response.url.lower():
+                    url_l = response.url.lower()
+                    # Only care about XHR / fetch calls, skip static assets
+                    if request.resource_type in ("xhr", "fetch") or "/api/" in url_l:
+                        try:
+                            snippet = (await response.text())[:500]
+                        except Exception:
+                            snippet = "<unreadable>"
+                        print("[DISCOVER] " + "-" * 80)
+                        print(f"[DISCOVER] {request.method} {response.status} {response.url}")
+                        print(f"[DISCOVER] body snippet: {snippet}")
+
                 if not is_interesting_request(response.url, request.resource_type):
                     return
 
@@ -791,6 +952,23 @@ async def main():
 
                 company_id = ctx.get("current_company_id")
                 if company_id is None:
+                    return
+
+                url_l = response.url.lower()
+
+                # ── Branch: company info (org detail or mixed_companies) ──────────────
+                if "api/v1/organizations/" in url_l or "api/v1/mixed_companies/search" in url_l:
+                    # Only log in get_company mode, and only once per company.
+                    # Add to the set BEFORE awaiting to prevent async race between
+                    # multiple concurrent response events for the same company.
+                    if ctx.get("mode") == "get_company" and company_id not in ctx["company_info_logged"]:
+                        ctx["company_info_logged"].add(company_id)
+                        await log_company_info(body_text, company_id)
+                    return
+
+                # ── Branch: people search pages ───────────────────────────────────────
+                # In get_company mode we only want company info — skip people entirely
+                if ctx.get("mode") == "get_company":
                     return
 
                 try:
@@ -841,7 +1019,14 @@ async def main():
         batch_num = 0
         while True:
             try:
-                records = await fetch_companies(args.sources or None)
+                if args.mode == "get_company":
+                    rec = await fetch_company_from_queue()
+                    records = [rec] if rec else []
+                elif args.mode == "new_person":
+                    rec = await fetch_new_person_company()
+                    records = [rec] if rec else []
+                else:
+                    records = await fetch_companies(args.sources or None)
             except Exception as e:
                 print(f"Failed to fetch companies from backend: {e}")
                 break
@@ -869,13 +1054,88 @@ async def main():
                 print(f"company_domain = {company_domain}")
                 print(f"company_name   = {company_name}")
                 print(f"company_source = {company_source}")
+                print(f"mode           = {args.mode}")
                 print("#" * 120)
+
+                # get_company needs current_company_id set before search so handle_response
+                # can capture org API responses during navigation to the org page.
+                # add_person / new_person must NOT set it here: Apollo fires a spurious
+                # mixed_people/search when the org overview page loads during the search,
+                # and handle_response would save those unfiltered results.
+                # open_people_page_and_run_old_logic() sets it just-in-time instead.
+                if args.mode == "get_company":
+                    ctx["current_company_id"] = company_id
+
+                # ── new_person fast-path: contact_info.source == "apollo" ─────────────────
+                # When the DB already holds Apollo-sourced company info, the org_id is in
+                # contact_info.companyId.  Build the people URL directly and skip the
+                # Apollo search entirely.
+                if args.mode == "new_person":
+                    contact_info = rec.get("contact_info") or {}
+                    if isinstance(contact_info, str):
+                        try:
+                            contact_info = json.loads(contact_info)
+                        except Exception:
+                            contact_info = {}
+
+                    if contact_info.get("source") == "apollo" and contact_info.get("companyId"):
+                        apollo_org_id = contact_info["companyId"]
+                        people_url = (
+                            f"https://app.apollo.io/#/organizations/{apollo_org_id}/people/"
+                            f"?page=1&sortByField=recommendations_score&sortAscending=false"
+                            f"&personLocations[]=United%20States&contactEmailStatusV2[]=verified"
+                        )
+                        print(f"[new_person] Apollo fast-path: org_id={apollo_org_id}, people_url={people_url}")
+
+                        if not await handle_cloudflare(page, ctx):
+                            print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
+                            ctx["current_company_id"] = None
+                            try:
+                                await end_new_person_company(company_id, False)
+                            except Exception as e:
+                                print(f"Failed to mark company_id={company_id}: {e}")
+                            await asyncio.sleep(random.randint(8, 15))
+                            print("Returning to home page for next target...")
+                            await page.goto(HOME_URL, wait_until="domcontentloaded")
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=10000)
+                            except PlaywrightTimeoutError:
+                                pass
+                            await handle_cloudflare(page, ctx)
+                            await human_idle(page, min_ms=2000, max_ms=4000)
+                            continue
+
+                        ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
+                        print("open_people_page_and_run_old_logic:", ok, msg)
+                        if not ok:
+                            print(f"People page failed for company_id={company_id}: {msg}")
+                            try:
+                                await end_new_person_company(company_id, False)
+                            except Exception as e:
+                                print(f"Failed to mark company_id={company_id} as failed: {e}")
+
+                        await asyncio.sleep(random.randint(8, 15))
+                        print("Returning to home page for next target...")
+                        await page.goto(HOME_URL, wait_until="domcontentloaded")
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=10000)
+                        except PlaywrightTimeoutError:
+                            pass
+                        await handle_cloudflare(page, ctx)
+                        await human_idle(page, min_ms=2000, max_ms=4000)
+                        continue  # skip the search block below
 
                 # Check for Cloudflare before attempting to search
                 if not await handle_cloudflare(page, ctx):
                     print(f"Cloudflare blocked search for company_id={company_id}. Skipping.")
+                    ctx["current_company_id"] = None
                     try:
-                        await end_company(company_id)
+                        if args.mode == "get_company":
+                            await end_company_queue(company_id)
+                        elif args.mode == "new_person":
+                            await end_new_person_company(company_id, False)
+                        else:
+                            await end_company(company_id)
                     except Exception as e:
                         print(f"Failed to mark company_id={company_id}: {e}")
                     continue
@@ -896,37 +1156,72 @@ async def main():
 
                 if not result:
                     print(f"No matching company found for {company_domain}. Marking company_id={company_id} to avoid infinite retry.")
+                    ctx["current_company_id"] = None
                     try:
-                        await end_company(company_id)
+                        if args.mode == "get_company":
+                            await end_company_queue(company_id)
+                        elif args.mode == "new_person":
+                            await end_new_person_company(company_id, False)
+                        else:
+                            await end_company(company_id)
                     except Exception as e:
                         print(f"Failed to mark company_id={company_id}: {e}")
                     continue
 
-                people_url = build_people_url_from_company_url(company_url or page.url)
-                print("Derived people URL:", people_url)
-
-                if not people_url:
-                    print("Could not derive people URL from company page. Marking company_id={company_id} to avoid infinite retry.")
+                # ── Mode: get_company ────────────────────────────────────────────────────
+                # Company info was captured automatically by handle_response when Apollo's
+                # api/v1/organizations/ endpoint fired while search_company_on_searchtag
+                # navigated to the org page.  Just wait briefly for in-flight responses,
+                # mark the company done, then move on.
+                if args.mode == "get_company":
+                    await page.wait_for_timeout(random.randint(1500, 3000))
                     try:
-                        await end_company(company_id)
+                        await end_company_queue(company_id)
+                        print(f"[get_company] Marked company_id={company_id} as done.")
                     except Exception as e:
-                        print(f"Failed to mark company_id={company_id}: {e}")
-                    continue
+                        print(f"[get_company] Failed to mark company_id={company_id}: {e}")
+                    finally:
+                        ctx["current_company_id"] = None
 
-                # Check for Cloudflare before opening people page
-                if not await handle_cloudflare(page, ctx):
-                    print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
-                    try:
-                        await end_company(company_id)
-                    except Exception as e:
-                        print(f"Failed to mark company_id={company_id}: {e}")
-                    continue
+                # ── Mode: add_person / new_person ────────────────────────────────────────
+                else:
+                    people_url = build_people_url_from_company_url(company_url or page.url)
+                    print("Derived people URL:", people_url)
 
-                ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
-                print("open_people_page_and_run_old_logic:", ok, msg)
+                    if not people_url:
+                        print(f"Could not derive people URL from company page. Marking company_id={company_id} to avoid infinite retry.")
+                        ctx["current_company_id"] = None
+                        try:
+                            if args.mode == "new_person":
+                                await end_new_person_company(company_id, False)
+                            else:
+                                await end_company(company_id)
+                        except Exception as e:
+                            print(f"Failed to mark company_id={company_id}: {e}")
+                    else:
+                        # Check for Cloudflare before opening people page
+                        if not await handle_cloudflare(page, ctx):
+                            print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
+                            ctx["current_company_id"] = None
+                            try:
+                                if args.mode == "new_person":
+                                    await end_new_person_company(company_id, False)
+                                else:
+                                    await end_company(company_id)
+                            except Exception as e:
+                                print(f"Failed to mark company_id={company_id}: {e}")
+                        else:
+                            ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
+                            print("open_people_page_and_run_old_logic:", ok, msg)
 
-                if not ok:
-                    print(f"People page failed for company_id={company_id}: {msg}")
+                            if not ok:
+                                print(f"People page failed for company_id={company_id}: {msg}")
+                                if args.mode == "new_person":
+                                    try:
+                                        await end_new_person_company(company_id, False)
+                                    except Exception as e:
+                                        print(f"Failed to mark company_id={company_id} as failed: {e}")
+
                 await asyncio.sleep(random.randint(8, 15))
                 # Go back home before next company search
                 print("Returning to home page for next target...")
