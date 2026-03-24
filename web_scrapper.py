@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 import time
@@ -492,6 +493,27 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 
     # 2) Focus and clear old text
     try:
+        # Dismiss any Apollo modal/overlay (e.g. "What's new", profile prompt, or any
+        # leftover dialog) that would intercept pointer events and make hover time out.
+        # Apollo portals these as <div data-open="true" role="presentation" data-backdrop=…>
+        try:
+            overlay = page.locator("[data-open='true'][role='presentation']")
+            if await overlay.count() > 0:
+                print("Apollo modal overlay detected — pressing Escape to dismiss...")
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(600)
+                # Still present? Click in the top-left corner (always outside any modal)
+                if await overlay.count() > 0:
+                    await page.mouse.click(593, 450)
+                    await page.wait_for_timeout(600)
+                # If overlay is STILL present after both attempts, the page is stuck —
+                # kill the entire process so the user can investigate.
+                if await overlay.count() > 0:
+                    print("Overlay persists after all dismissal attempts — terminating process.")
+                    sys.exit(1)
+        except Exception as _ov_err:
+            print(f"Overlay dismiss attempt failed (non-fatal): {_ov_err}")
+
         await human_mouse_move(page)
         await search_input.hover()
         await page.wait_for_timeout(random.randint(200, 450))
