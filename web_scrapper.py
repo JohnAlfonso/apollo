@@ -234,7 +234,7 @@ async def human_mouse_move(page, target_x: int | None = None, target_y: int | No
     end_y = target_y if target_y is not None else random.randint(80, vp["height"] - 80)
 
     # Use many fine steps with a per-step delay so movement is visibly slow
-    steps = random.randint(30, 60)
+    steps = random.randint(9, 18)
 
     # Bézier control point: offset the midpoint randomly to curve the path
     mid_x = (end_x) / 2 + random.randint(-120, 120)
@@ -255,11 +255,11 @@ async def human_mouse_move(page, target_x: int | None = None, target_y: int | No
         await page.mouse.move(bx, by)
         # Variable per-step delay: slower at start/end, faster in middle (ease-in-out feel)
         ease = 1 - abs(2 * t - 1)  # 0→1→0
-        step_delay = int(random.randint(8, 18) + ease * random.randint(10, 25))
+        step_delay = int(random.randint(2, 5) + ease * random.randint(3, 8))
         await page.wait_for_timeout(step_delay)
 
     # Short pause after arriving, like a human settling the cursor
-    await page.wait_for_timeout(random.randint(80, 250))
+    await page.wait_for_timeout(random.randint(24, 75))
 
 
 async def human_scroll(page, direction: str = "down"):
@@ -269,7 +269,7 @@ async def human_scroll(page, direction: str = "down"):
     delta = total // steps
     for _ in range(steps):
         await page.mouse.wheel(0, delta)
-        await page.wait_for_timeout(random.randint(80, 220))
+        await page.wait_for_timeout(random.randint(24, 66))
 
 
 async def human_idle(page, min_ms: int = 1500, max_ms: int = 4000):
@@ -282,7 +282,7 @@ async def human_idle(page, min_ms: int = 1500, max_ms: int = 4000):
         elif action == "scroll":
             await human_scroll(page, direction=random.choice(["down", "down", "up"]))
         else:
-            await page.wait_for_timeout(random.randint(400, 1000))
+            await page.wait_for_timeout(random.randint(120, 300))
 
 
 # ─────────────────────── cloudflare detection & handling ───────────────────
@@ -387,7 +387,7 @@ async def handle_cloudflare(page, ctx: dict | None = None) -> bool:
         if ctx is not None:
             ctx["last_cf_solved_at"] = time.time()
         print("Cloudflare challenge solved manually. Resuming...")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(600)
         return True
 
     # Should never reach here (wait_for_manual_cf_solve loops forever)
@@ -501,11 +501,11 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
             if await overlay.count() > 0:
                 print("Apollo modal overlay detected — pressing Escape to dismiss...")
                 await page.keyboard.press("Escape")
-                await page.wait_for_timeout(600)
+                await page.wait_for_timeout(180)
                 # Still present? Click in the top-left corner (always outside any modal)
                 if await overlay.count() > 0:
                     await page.mouse.click(593, 450)
-                    await page.wait_for_timeout(600)
+                    await page.wait_for_timeout(180)
                 # If overlay is STILL present after both attempts, the page is stuck —
                 # kill the entire process so the user can investigate.
                 if await overlay.count() > 0:
@@ -516,29 +516,29 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 
         await human_mouse_move(page)
         await search_input.hover()
-        await page.wait_for_timeout(random.randint(200, 450))
+        await page.wait_for_timeout(random.randint(60, 135))
         await search_input.click()
-        await page.wait_for_timeout(random.randint(200, 400))
+        await page.wait_for_timeout(random.randint(60, 120))
 
         await search_input.fill("")
-        await page.wait_for_timeout(random.randint(150, 300))
+        await page.wait_for_timeout(random.randint(45, 90))
 
         await search_input.click()
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Backspace")
-        await page.wait_for_timeout(random.randint(200, 400))
+        await page.wait_for_timeout(random.randint(60, 120))
     except Exception as e:
         return False, f"Could not clear search input: {e}", None
 
     # 3) Type target domain with natural per-character delay
     try:
-        await search_input.type(target_domain, delay=random.randint(80, 150))
-        await page.wait_for_timeout(random.randint(2000, 3000))
+        await search_input.type(target_domain, delay=random.randint(24, 45))
+        await page.wait_for_timeout(random.randint(600, 900))
     except Exception as e:
         return False, f"Could not type search term: {e}", None
 
     # 4) Wait for dropdown and possible API results
-    await page.wait_for_timeout(2500)
+    await page.wait_for_timeout(750)
 
     candidate_rows = []
     retry = 0
@@ -625,7 +625,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
             if retry > 4:
                 return False, "No candidate companies appeared", None
             retry = retry + 1
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(600)
         else:
             break
 
@@ -689,7 +689,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     try:
         await human_mouse_move(page)
         await selected["locator"].hover()
-        await page.wait_for_timeout(random.randint(250, 600))
+        await page.wait_for_timeout(random.randint(75, 180))
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
             await selected["locator"].click()
         clicked = True
@@ -697,7 +697,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
         # Apollo is SPA-heavy. Normal navigation often won't fire.
         try:
             await selected["locator"].hover()
-            await page.wait_for_timeout(random.randint(150, 350))
+            await page.wait_for_timeout(random.randint(45, 105))
             await selected["locator"].click()
             clicked = True
         except Exception as e:
@@ -721,7 +721,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     except PlaywrightTimeoutError:
         print("networkidle timeout after company click; continuing")
 
-    await page.wait_for_timeout(3000)
+    await page.wait_for_timeout(900)
 
     current_url = page.url
     print("After company click, current URL:", current_url)
@@ -778,7 +778,7 @@ async def click_next_pagination(page):
     try:
         await human_mouse_move(page)
         await next_button.hover()
-        await page.wait_for_timeout(random.randint(300, 700))
+        await page.wait_for_timeout(random.randint(90, 210))
         async with page.expect_response(
             lambda r: "api/v1/mixed_people/search" in r.url.lower(),
             timeout=20000
@@ -805,7 +805,7 @@ async def click_next_pagination(page):
     except PlaywrightTimeoutError:
         print("networkidle timeout after clicking Next; continuing")
 
-    await page.wait_for_timeout(3000)
+    await page.wait_for_timeout(900)
     print("After Next click, current URL:", page.url)
 
     return False, "Clicked Next successfully"
@@ -830,7 +830,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
 
         print("************* ========= *************")
         # Simulate idle human behaviour while the page loads
-        await human_idle(page, min_ms=8000, max_ms=12000)
+        await human_idle(page, min_ms=2400, max_ms=3600)
         print("************* ========= *************")
 
         while True:
@@ -840,7 +840,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             if "not found" in reason.lower() or "disabled" in reason.lower():
                 break
 
-            await asyncio.sleep(random.randint(6, 10))
+            await asyncio.sleep(random.randint(2, 3))
 
         if ctx.get("mode") == "new_person":
             await end_new_person_company(company_id, True)
@@ -906,7 +906,7 @@ async def main():
         )
 
         page = await context.new_page()
-        time.sleep(30)
+        time.sleep(9)
         async def handle_request(request):
             try:
                 if not is_interesting_request(request.url, request.resource_type):
@@ -1036,7 +1036,7 @@ async def main():
             await browser.close()
             return
 
-        await human_idle(page, min_ms=4000, max_ms=7000)
+        await human_idle(page, min_ms=1200, max_ms=2100)
 
         batch_num = 0
         while True:
@@ -1116,7 +1116,7 @@ async def main():
                                 await end_new_person_company(company_id, False)
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id}: {e}")
-                            await asyncio.sleep(random.randint(8, 15))
+                            await asyncio.sleep(random.randint(2, 5))
                             print("Returning to home page for next target...")
                             await page.goto(HOME_URL, wait_until="domcontentloaded")
                             try:
@@ -1124,7 +1124,7 @@ async def main():
                             except PlaywrightTimeoutError:
                                 pass
                             await handle_cloudflare(page, ctx)
-                            await human_idle(page, min_ms=2000, max_ms=4000)
+                            await human_idle(page, min_ms=600, max_ms=1200)
                             continue
 
                         ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
@@ -1136,7 +1136,7 @@ async def main():
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                        await asyncio.sleep(random.randint(8, 15))
+                        await asyncio.sleep(random.randint(2, 5))
                         print("Returning to home page for next target...")
                         await page.goto(HOME_URL, wait_until="domcontentloaded")
                         try:
@@ -1144,7 +1144,7 @@ async def main():
                         except PlaywrightTimeoutError:
                             pass
                         await handle_cloudflare(page, ctx)
-                        await human_idle(page, min_ms=2000, max_ms=4000)
+                        await human_idle(page, min_ms=600, max_ms=1200)
                         continue  # skip the search block below
 
                 # Check for Cloudflare before attempting to search
@@ -1172,7 +1172,7 @@ async def main():
                     print("search_company_on_searchtag:", result, reason, company_url)
 
                     if not result and reason == "Search input not found":
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_timeout(600)
                     else:
                         break
 
@@ -1196,7 +1196,7 @@ async def main():
                 # navigated to the org page.  Just wait briefly for in-flight responses,
                 # mark the company done, then move on.
                 if args.mode == "get_company":
-                    await page.wait_for_timeout(random.randint(1500, 3000))
+                    await page.wait_for_timeout(random.randint(450, 900))
                     try:
                         await end_company_queue(company_id)
                         print(f"[get_company] Marked company_id={company_id} as done.")
@@ -1244,7 +1244,7 @@ async def main():
                                     except Exception as e:
                                         print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                await asyncio.sleep(random.randint(8, 15))
+                await asyncio.sleep(random.randint(2, 5))
                 # Go back home before next company search
                 print("Returning to home page for next target...")
                 await page.goto(HOME_URL, wait_until="domcontentloaded")
@@ -1254,7 +1254,7 @@ async def main():
                     print("networkidle timeout when returning home; continuing")
 
                 await handle_cloudflare(page, ctx)
-                await human_idle(page, min_ms=2000, max_ms=4000)
+                await human_idle(page, min_ms=600, max_ms=1200)
 
         if DEBUG_LOG_RESPONSES:
             await dump_json(REQUEST_LOG_FILE, request_logs)
