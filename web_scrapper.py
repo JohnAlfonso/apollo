@@ -22,6 +22,27 @@ DEBUG_LOG_RESPONSES = os.environ.get("APOLLO_DEBUG_LOG", "").lower() in ("1", "t
 # Set APOLLO_DISCOVER_ENDPOINTS=1 to log ALL Apollo API calls and discover the company info endpoint
 DISCOVER_ENDPOINTS = os.environ.get("APOLLO_DISCOVER_ENDPOINTS", "").lower() in ("1", "true", "yes")
 
+# ── Resource blocking (CPU reduction) ───────────────────────────────────────
+# Block heavy but non-essential resource types — scripts are intentionally
+# kept because Apollo is an SPA and all API interception depends on JS.
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+
+# Third-party tracking / analytics domains that burn CPU but give us nothing.
+BLOCKED_DOMAINS = [
+    "googletagmanager.com", "google-analytics.com", "doubleclick.net",
+    "googlesyndication.com", "googleadservices.com",
+    "hotjar.com", "segment.io", "segment.com",
+    "amplitude.com", "mixpanel.com",
+    "intercom.io", "intercomcdn.com",
+    "fullstory.com", "sentry.io", "clarity.ms",
+    "facebook.net", "ads.twitter.com",
+    "adroll.com", "optimizely.com",
+    "heap.io", "heapanalytics.com",
+    "cdn.pendo.io", "pendo.io",
+    "cdn.appcues.com", "appcues.com",
+    "bat.bing.com",
+]
+
 
 def is_interesting_request(url: str, resource_type: str) -> bool:
     url_l = url.lower()
@@ -830,6 +851,12 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
 
             await asyncio.sleep(random.randint(2, 3))
 
+        # Stop all pending JS/XHR on the current page to free CPU before moving on.
+        try:
+            await page.evaluate("() => { window.stop(); }")
+        except Exception:
+            pass
+
         if ctx.get("mode") == "new_person":
             await end_new_person_company(company_id, True)
             print(f"[new_person] Set flag1=1 (success) for company_id={company_id}")
@@ -864,6 +891,13 @@ def parse_args():
             "get_company: capture company profile info only (name, phone, industry, address, etc.)."
         ),
     )
+    parser.add_argument(
+        "--headless",
+        type=lambda v: v.lower() not in ("0", "false", "no"),
+        default=os.environ.get("HEADLESS", "true"),
+        metavar="BOOL",
+        help="Run browser in headless mode (default: true). Pass --headless false to show UI.",
+    )
     return parser.parse_args()
 
 
@@ -883,7 +917,7 @@ async def main():
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True,
+            headless=args.headless,
             slow_mo=0
         )
 
@@ -893,7 +927,24 @@ async def main():
             service_workers="block",
         )
 
+        # ── Route-level CPU reduction ────────────────────────────────────────
+        # Abort heavy static assets and third-party trackers before they load.
+        # This runs at the network layer — zero rendering cost for blocked URLs.
+        async def _block_route(route):
+            rt = route.request.resource_type
+            url = route.request.url.lower()
+            if rt in BLOCKED_RESOURCE_TYPES:
+                await route.abort()
+                return
+            if any(d in url for d in BLOCKED_DOMAINS):
+                await route.abort()
+                return
+            await route.continue_()
+
+        await context.route("**/*", _block_route)
+
         page = await context.new_page()
+        print(f"[DEBUG] Open pages: {len(context.pages)}")
         await asyncio.sleep(3)
         async def handle_request(request):
             try:
@@ -1113,8 +1164,9 @@ async def main():
                                 await end_new_person_company(company_id, False)
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id}: {e}")
-                            await asyncio.sleep(random.randint(5, 10))
+                            await asyncio.sleep(random.randint(2, 5))
                             print("Returning to home page for next target...")
+                            await page.goto("about:blank")
                             await page.goto(HOME_URL, wait_until="domcontentloaded")
                             try:
                                 await page.wait_for_load_state("networkidle", timeout=10000)
@@ -1133,8 +1185,9 @@ async def main():
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                        await asyncio.sleep(random.randint(5, 10))
+                        await asyncio.sleep(random.randint(2, 5))
                         print("Returning to home page for next target...")
+                        await page.goto("about:blank")
                         await page.goto(HOME_URL, wait_until="domcontentloaded")
                         try:
                             await page.wait_for_load_state("networkidle", timeout=10000)
@@ -1241,9 +1294,10 @@ async def main():
                                     except Exception as e:
                                         print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                await asyncio.sleep(random.randint(5, 10))
-                # Go back home before next company search
+                await asyncio.sleep(random.randint(2, 5))
+                # Blank the page first to stop all lingering JS/React before reloading home.
                 print("Returning to home page for next target...")
+                await page.goto("about:blank")
                 await page.goto(HOME_URL, wait_until="domcontentloaded")
                 try:
                     await page.wait_for_load_state("networkidle", timeout=10000)
@@ -1252,6 +1306,7 @@ async def main():
 
                 await handle_cloudflare(page, ctx)
                 await human_idle(page, min_ms=600, max_ms=1200)
+                print(f"[DEBUG] Open pages: {len(context.pages)}")
 
         if DEBUG_LOG_RESPONSES:
             await dump_json(REQUEST_LOG_FILE, request_logs)
