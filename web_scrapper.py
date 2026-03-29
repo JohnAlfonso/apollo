@@ -226,40 +226,24 @@ async def dump_json(path: str, data):
 # ─────────────────────── human-like behaviour helpers ───────────────────────
 
 async def human_mouse_move(page, target_x: int | None = None, target_y: int | None = None):
-    """Move the mouse slowly along a curved path, like a real human hand."""
     vp = page.viewport_size or {"width": 1440, "height": 900}
 
-    # Destination — random if not specified
     end_x = target_x if target_x is not None else random.randint(80, vp["width"] - 80)
     end_y = target_y if target_y is not None else random.randint(80, vp["height"] - 80)
 
-    # Use many fine steps with a per-step delay so movement is visibly slow
-    steps = random.randint(9, 18)
+    # 🔥 REDUCED steps (was 9–18)
+    steps = random.randint(3, 6)
 
-    # Bézier control point: offset the midpoint randomly to curve the path
-    mid_x = (end_x) / 2 + random.randint(-120, 120)
-    mid_y = (end_y) / 2 + random.randint(-120, 120)
+    mid_x = (end_x) / 2 + random.randint(-60, 60)
+    mid_y = (end_y) / 2 + random.randint(-60, 60)
 
-    prev_x, prev_y = None, None
     for i in range(1, steps + 1):
         t = i / steps
-        # Quadratic Bézier interpolation
         bx = int((1 - t) ** 2 * 0 + 2 * (1 - t) * t * mid_x + t ** 2 * end_x)
         by = int((1 - t) ** 2 * 0 + 2 * (1 - t) * t * mid_y + t ** 2 * end_y)
 
-        # Skip duplicate points to avoid redundant Playwright calls
-        if bx == prev_x and by == prev_y:
-            continue
-        prev_x, prev_y = bx, by
-
         await page.mouse.move(bx, by)
-        # Variable per-step delay: slower at start/end, faster in middle (ease-in-out feel)
-        ease = 1 - abs(2 * t - 1)  # 0→1→0
-        step_delay = int(random.randint(2, 5) + ease * random.randint(3, 8))
-        await page.wait_for_timeout(step_delay)
-
-    # Short pause after arriving, like a human settling the cursor
-    await page.wait_for_timeout(random.randint(24, 75))
+        await page.wait_for_timeout(random.randint(5, 15))  # 🔥 reduced delay
 
 
 async def human_scroll(page, direction: str = "down"):
@@ -272,17 +256,21 @@ async def human_scroll(page, direction: str = "down"):
         await page.wait_for_timeout(random.randint(24, 66))
 
 
-async def human_idle(page, min_ms: int = 1500, max_ms: int = 4000):
-    """Simulate an idle human: move mouse slowly and randomly scroll while waiting."""
+async def human_idle(page, min_ms: int = 800, max_ms: int = 1500):
+    # 🔥 shorter + less aggressive
+    if random.random() > 0.3:
+        await page.wait_for_timeout(random.randint(min_ms, max_ms))
+        return
+
     end_time = asyncio.get_event_loop().time() + random.uniform(min_ms / 1000, max_ms / 1000)
+
     while asyncio.get_event_loop().time() < end_time:
-        action = random.choice(["move", "move", "scroll", "pause"])
+        action = random.choice(["move", "pause"])  # 🔥 removed scroll
+
         if action == "move":
             await human_mouse_move(page)
-        elif action == "scroll":
-            await human_scroll(page, direction=random.choice(["down", "down", "up"]))
         else:
-            await page.wait_for_timeout(random.randint(120, 300))
+            await page.wait_for_timeout(random.randint(100, 250))
 
 
 # ─────────────────────── cloudflare detection & handling ───────────────────
@@ -830,7 +818,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
 
         print("************* ========= *************")
         # Simulate idle human behaviour while the page loads
-        await human_idle(page, min_ms=2400, max_ms=3600)
+        await human_idle(page, min_ms=1200, max_ms=1800)
         print("************* ========= *************")
 
         while True:
@@ -895,8 +883,8 @@ async def main():
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,
-            slow_mo=100
+            headless=True,
+            slow_mo=0
         )
 
         context = await browser.new_context(
@@ -906,7 +894,7 @@ async def main():
         )
 
         page = await context.new_page()
-        time.sleep(9)
+        await asyncio.sleep(3)
         async def handle_request(request):
             try:
                 if not is_interesting_request(request.url, request.resource_type):
@@ -956,10 +944,19 @@ async def main():
                 if not is_interesting_request(response.url, request.resource_type):
                     return
 
+                url_l = response.url.lower()
+
+                # 🔥 HARD FILTER (only process what you REALLY need)
+                if not (
+                    "api/v1/mixed_people/search" in url_l
+                    or "api/v1/organizations/" in url_l
+                ):
+                    return
+
                 try:
                     body_text = await response.text()
                 except Exception:
-                    body_text = "<could not decode response body>"
+                    return
 
                 if DEBUG_LOG_RESPONSES:
                     response_logs.append({
@@ -1116,7 +1113,7 @@ async def main():
                                 await end_new_person_company(company_id, False)
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id}: {e}")
-                            await asyncio.sleep(random.randint(2, 5))
+                            await asyncio.sleep(random.randint(5, 10))
                             print("Returning to home page for next target...")
                             await page.goto(HOME_URL, wait_until="domcontentloaded")
                             try:
@@ -1136,7 +1133,7 @@ async def main():
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                        await asyncio.sleep(random.randint(2, 5))
+                        await asyncio.sleep(random.randint(5, 10))
                         print("Returning to home page for next target...")
                         await page.goto(HOME_URL, wait_until="domcontentloaded")
                         try:
@@ -1244,7 +1241,7 @@ async def main():
                                     except Exception as e:
                                         print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                await asyncio.sleep(random.randint(2, 5))
+                await asyncio.sleep(random.randint(5, 10))
                 # Go back home before next company search
                 print("Returning to home page for next target...")
                 await page.goto(HOME_URL, wait_until="domcontentloaded")
