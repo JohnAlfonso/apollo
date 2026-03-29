@@ -25,7 +25,7 @@ DISCOVER_ENDPOINTS = os.environ.get("APOLLO_DISCOVER_ENDPOINTS", "").lower() in 
 # ── Resource blocking (CPU reduction) ───────────────────────────────────────
 # Block heavy but non-essential resource types — scripts are intentionally
 # kept because Apollo is an SPA and all API interception depends on JS.
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
 # Third-party tracking / analytics domains that burn CPU but give us nothing.
 BLOCKED_DOMAINS = [
@@ -1212,6 +1212,7 @@ async def main():
                         print(f"Failed to mark company_id={company_id}: {e}")
                     continue
 
+                _search_retry = 0
                 while True:
                     result, reason, company_url = await search_company_on_searchtag(
                         page,
@@ -1222,7 +1223,19 @@ async def main():
                     print("search_company_on_searchtag:", result, reason, company_url)
 
                     if not result and reason == "Search input not found":
-                        await page.wait_for_timeout(600)
+                        _search_retry += 1
+                        if _search_retry >= 5:
+                            print("Search input still not found after 5 retries. Reloading home page...")
+                            await page.goto("about:blank")
+                            await page.goto(HOME_URL, wait_until="domcontentloaded")
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=10000)
+                            except PlaywrightTimeoutError:
+                                pass
+                            await handle_cloudflare(page, ctx)
+                            _search_retry = 0
+                        else:
+                            await page.wait_for_timeout(1500)
                     else:
                         break
 
