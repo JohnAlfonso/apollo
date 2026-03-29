@@ -123,13 +123,9 @@ def extract_org_id(company_url: str) -> str | None:
 # Values CONFIRMED from real Apollo UI and URL screenshots.
 # All valid values: owner, founder, c_suite, partner, vp, head, director, manager, senior, entry, intern
 SENIORITY_SEGMENTS: list[list[str]] = [
-    ["owner"],
-    ["founder"],
-    ["c_suite"],
-    ["partner"],
-    ["vp"],
-    ["head"],
-    ["director"],
+    ["owner", "founder", "c_suite"],
+    ["partner", "vp"],
+    ["head", "director"],
     ["manager"],
     ["senior"],
     ["entry"],
@@ -930,11 +926,13 @@ async def _paginate_people_url(page, people_url: str, ctx: dict, label: str) -> 
 
 async def open_people_page_and_run_old_logic(page, people_url: str, company_id: int, ctx: dict):
     """
-    Paginate the people list for a company using 2-level segmentation to bypass
-    Apollo's 1000-result per-query cap:
+    Paginate the people list for a company using conditional segmentation:
 
-      Level 1 – seniority segments (always run)
-      Level 2 – department sub-segments (only when seniority segment > 1000)
+      - Always loads the unsegmented URL first and checks total_entries.
+      - If total <= 1000: paginate that URL directly (no filters applied).
+      - If total > 1000:
+          Level 1 – seniority segments
+          Level 2 – job title sub-segments (only when seniority segment > 1000)
 
     Falls back to a single unsegmented pass when the org_id cannot be extracted.
     """
@@ -945,8 +943,6 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
         if "#/login" in page.url:
             return False, "Session expired or invalid"
 
-        # Try to extract org_id for segmented URLs.
-        # If not possible, fall back to the original single URL.
         org_id = extract_org_id(people_url)
         if not org_id:
             print("[Segment] Could not extract org_id — running single unsegmented pass.")
@@ -954,52 +950,80 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             if not ok:
                 return False, "Session expired during pagination"
         else:
-            print(f"[Segment] org_id={org_id} — starting 2-level segmented scrape")
+            # ── Step 0: load unsegmented URL and check total_entries ─────────────
+            ctx["segment_total_entries"] = None
+            await page.goto(people_url, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
 
-            for seniority_group in SENIORITY_SEGMENTS:
-                seg_label = f"seniority={seniority_group}"
-                seg_url = build_people_url_segmented(org_id, seniorities=seniority_group)
+            if "#/login" in page.url:
+                return False, "Session expired"
 
-                # Navigate and capture total_entries from the first API response
-                ctx["segment_total_entries"] = None
-                await page.goto(seg_url, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+            total = ctx.get("segment_total_entries")
+            print(f"[Segment] Unsegmented total_entries={total}")
+
+            if total is None or total <= PEOPLE_LIMIT:
+                # ── Within limit: paginate the already-loaded unsegmented page ───
+                print(f"[Segment] total={total} ≤ {PEOPLE_LIMIT} — paginating without filters")
+                await human_idle(page, min_ms=360, max_ms=540)
+                while True:
+                    result, reason = await click_next_pagination(page)
+                    print("click_next_pagination:", result, reason)
+                    if "not found" in reason.lower() or "disabled" in reason.lower():
+                        break
+                    await asyncio.sleep(1)
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                except PlaywrightTimeoutError:
+                    await page.evaluate("() => { window.stop(); }")
+                except Exception:
                     pass
+            else:
+                # ── Over limit: apply Level 1 seniority segmentation ─────────────
+                print(f"[Segment] total={total} > {PEOPLE_LIMIT} — applying seniority segmentation")
+                for seniority_group in SENIORITY_SEGMENTS:
+                    seg_label = f"seniority={seniority_group}"
+                    seg_url = build_people_url_segmented(org_id, seniorities=seniority_group)
 
-                if "#/login" in page.url:
-                    return False, "Session expired"
-
-                # Wait briefly so handle_response has time to fire and populate total_entries
-                await page.wait_for_timeout(2000)
-                total = ctx.get("segment_total_entries")
-                print(f"[Segment] {seg_label} → total_entries={total}")
-
-                if total is not None and total > PEOPLE_LIMIT:
-                    # ── Level 2: split by job title ──────────────────────────────
-                    print(f"[Segment] {seg_label} exceeds {PEOPLE_LIMIT} — splitting by job title")
-                    for title_group in JOB_TITLE_SEGMENTS:
-                        title_label = f"seniority={seniority_group} titles={title_group}"
-                        title_url = build_people_url_segmented(
-                            org_id,
-                            seniorities=seniority_group,
-                            titles=title_group,
-                        )
-                        await _paginate_people_url(page, title_url, ctx, title_label)
-                else:
-                    # ── Level 1 only: paginate this seniority group ──────────────
-                    await human_idle(page, min_ms=360, max_ms=540)
-                    while True:
-                        result, reason = await click_next_pagination(page)
-                        print("click_next_pagination:", result, reason)
-                        if "not found" in reason.lower() or "disabled" in reason.lower():
-                            break
-                        await asyncio.sleep(1)
+                    ctx["segment_total_entries"] = None
+                    await page.goto(seg_url, wait_until="domcontentloaded")
                     try:
-                        await page.evaluate("() => { window.stop(); }")
-                    except Exception:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except PlaywrightTimeoutError:
                         pass
+
+                    if "#/login" in page.url:
+                        return False, "Session expired"
+
+                    await page.wait_for_timeout(2000)
+                    seg_total = ctx.get("segment_total_entries")
+                    print(f"[Segment] {seg_label} → total_entries={seg_total}")
+
+                    if seg_total is not None and seg_total > PEOPLE_LIMIT:
+                        # ── Level 2: split by job title ──────────────────────────
+                        print(f"[Segment] {seg_label} exceeds {PEOPLE_LIMIT} — splitting by job title")
+                        for title_group in JOB_TITLE_SEGMENTS:
+                            title_label = f"seniority={seniority_group} titles={title_group}"
+                            title_url = build_people_url_segmented(
+                                org_id,
+                                seniorities=seniority_group,
+                                titles=title_group,
+                            )
+                            await _paginate_people_url(page, title_url, ctx, title_label)
+                    else:
+                        # ── Level 1 only: paginate this seniority group ──────────
+                        await human_idle(page, min_ms=360, max_ms=540)
+                        while True:
+                            result, reason = await click_next_pagination(page)
+                            print("click_next_pagination:", result, reason)
+                            if "not found" in reason.lower() or "disabled" in reason.lower():
+                                break
+                            await asyncio.sleep(1)
+                        try:
+                            await page.evaluate("() => { window.stop(); }")
+                        except Exception:
+                            pass
 
         # ── Mark company done ────────────────────────────────────────────────────
         if ctx.get("mode") == "new_person":
