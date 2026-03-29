@@ -837,8 +837,8 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             await end_company(company_id)
             print(f"Set modified_time for company_id={company_id}")
 
-        await page.screenshot(path="apollo_people_page_after_next.png", full_page=True)
-        print("Saved: apollo_people_page_after_next.png")
+        # await page.screenshot(path="apollo_people_page_after_next.png", full_page=True)
+        # print("Saved: apollo_people_page_after_next.png")
 
         print("Old logic finished.")
         return True, "OK"
