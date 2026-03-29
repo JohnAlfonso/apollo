@@ -92,7 +92,8 @@ def build_people_url_from_company_url(company_url: str) -> str | None:
     or
       https://app.apollo.io/#/organizations/<org_id>?...
     into:
-      https://app.apollo.io/#/organizations/<org_id>/people/?page=1&sortByField=recommendations_score&sortAscending=false&personLocations[]=United%20States
+      https://app.apollo.io/#/organizations/<org_id>/people?page=1&...
+    URL format confirmed from real Apollo URLs (no trailing slash before ?).
     """
     if not company_url:
         return None
@@ -103,10 +104,80 @@ def build_people_url_from_company_url(company_url: str) -> str | None:
 
     org_id = m.group(1)
     return (
-        f"https://app.apollo.io/#/organizations/{org_id}/people/"
+        f"https://app.apollo.io/#/organizations/{org_id}/people"
         f"?page=1&sortByField=recommendations_score&sortAscending=false"
         f"&personLocations[]=United%20States"
     )
+
+
+def extract_org_id(company_url: str) -> str | None:
+    """Extract the Apollo org_id from any organization URL."""
+    if not company_url:
+        return None
+    m = re.search(r"#/organizations/([^/?]+)", company_url)
+    return m.group(1) if m else None
+
+
+# ── Segmentation constants (used to bypass Apollo's 1000-result per-query cap) ──
+# Level-1 segments: one seniority value per query (never grouped).
+# Values CONFIRMED from real Apollo UI and URL screenshots.
+# All valid values: owner, founder, c_suite, partner, vp, head, director, manager, senior, entry, intern
+SENIORITY_SEGMENTS: list[list[str]] = [
+    ["owner"],
+    ["founder"],
+    ["c_suite"],
+    ["partner"],
+    ["vp"],
+    ["head"],
+    ["director"],
+    ["manager"],
+    ["senior"],
+    ["entry"],
+    ["intern"],
+]
+
+# Level-2 segments: job title groups.
+# Parameter name "personTitles[]" — CONFIRMED from real Apollo URL.
+# When a seniority segment exceeds 1000 results, it is split by these title groups.
+# Each group targets a broad function area; combined they cover the full workforce.
+JOB_TITLE_SEGMENTS: list[list[str]] = [
+    ["engineer", "developer", "programmer", "architect"],
+    ["data", "analyst", "scientist", "researcher"],
+    ["sales", "account executive", "account manager", "business development"],
+    ["manager", "supervisor", "lead", "head"],
+    ["director", "vice president", "president", "chief"],
+    ["marketing", "content", "brand", "communications"],
+    ["operations", "coordinator", "specialist", "administrator"],
+    ["finance", "accountant", "auditor", "controller"],
+    ["recruiter", "human resources", "talent", "people"],
+    ["product manager", "product owner", "designer", "ux"],
+    ["customer success", "support", "service", "consultant"],
+    ["legal", "attorney", "counsel", "compliance"],
+    ["teacher", "professor", "instructor", "trainer"],
+    ["intern", "associate", "assistant", "student"],
+]
+
+PEOPLE_LIMIT = 1000  # Apollo Pro plan cap per query
+
+
+def build_people_url_segmented(
+    org_id: str,
+    seniorities: list[str] | None = None,
+    titles: list[str] | None = None,
+) -> str:
+    """Build an Apollo people URL with optional seniority and job title filters.
+    Both personSeniorities[] and personTitles[] are confirmed from real Apollo URLs.
+    """
+    url = (
+        f"https://app.apollo.io/#/organizations/{org_id}/people"
+        f"?page=1&sortByField=recommendations_score&sortAscending=false"
+        f"&personLocations[]=United%20States"
+    )
+    for s in (seniorities or []):
+        url += f"&personSeniorities[]={s}"
+    for t in (titles or []):
+        url += f"&personTitles[]={t}"
+    return url
 
 
 _COUNTRY_TO_CODE: dict[str, str] = {
@@ -820,43 +891,117 @@ async def click_next_pagination(page):
     return False, "Clicked Next successfully"
 
 
+async def _paginate_people_url(page, people_url: str, ctx: dict, label: str) -> bool:
+    """
+    Navigate to people_url, paginate until done, return True on success.
+    Resets ctx['segment_total_entries'] before navigation so handle_response
+    can populate it from the first intercepted API response.
+    """
+    ctx["segment_total_entries"] = None  # reset for this segment
+
+    print(f"\n[Segment] Navigating: {label}")
+    print(f"[Segment] URL: {people_url}")
+    await page.goto(people_url, wait_until="domcontentloaded")
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except PlaywrightTimeoutError:
+        print("networkidle timeout; continuing")
+
+    if "#/login" in page.url:
+        return False
+
+    await human_idle(page, min_ms=360, max_ms=540)
+
+    while True:
+        result, reason = await click_next_pagination(page)
+        print("click_next_pagination:", result, reason)
+        if "not found" in reason.lower() or "disabled" in reason.lower():
+            break
+        await asyncio.sleep(1)
+
+    try:
+        await page.evaluate("() => { window.stop(); }")
+    except Exception:
+        pass
+
+    return True
+
+
 async def open_people_page_and_run_old_logic(page, people_url: str, company_id: int, ctx: dict):
-    """Open people page, paginate, save each page via handle_response, call end_company when done."""
+    """
+    Paginate the people list for a company using 2-level segmentation to bypass
+    Apollo's 1000-result per-query cap:
+
+      Level 1 – seniority segments (always run)
+      Level 2 – department sub-segments (only when seniority segment > 1000)
+
+    Falls back to a single unsegmented pass when the org_id cannot be extracted.
+    """
     ctx["current_company_id"] = company_id
     try:
         print(f"Opening people page: {people_url}")
-        await page.goto(people_url, wait_until="domcontentloaded")
-
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10000)
-        except PlaywrightTimeoutError:
-            print("networkidle timeout; continuing")
-
-        print("Current URL:", page.url)
 
         if "#/login" in page.url:
             return False, "Session expired or invalid"
 
-        print("************* ========= *************")
-        # Simulate idle human behaviour while the page loads
-        await human_idle(page, min_ms=1200, max_ms=1800)
-        print("************* ========= *************")
+        # Try to extract org_id for segmented URLs.
+        # If not possible, fall back to the original single URL.
+        org_id = extract_org_id(people_url)
+        if not org_id:
+            print("[Segment] Could not extract org_id — running single unsegmented pass.")
+            ok = await _paginate_people_url(page, people_url, ctx, "unsegmented")
+            if not ok:
+                return False, "Session expired during pagination"
+        else:
+            print(f"[Segment] org_id={org_id} — starting 2-level segmented scrape")
 
-        while True:
-            result, reason = await click_next_pagination(page)
-            print("click_next_pagination:", result, reason)
+            for seniority_group in SENIORITY_SEGMENTS:
+                seg_label = f"seniority={seniority_group}"
+                seg_url = build_people_url_segmented(org_id, seniorities=seniority_group)
 
-            if "not found" in reason.lower() or "disabled" in reason.lower():
-                break
+                # Navigate and capture total_entries from the first API response
+                ctx["segment_total_entries"] = None
+                await page.goto(seg_url, wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except PlaywrightTimeoutError:
+                    pass
 
-            await asyncio.sleep(random.randint(2, 3))
+                if "#/login" in page.url:
+                    return False, "Session expired"
 
-        # Stop all pending JS/XHR on the current page to free CPU before moving on.
-        try:
-            await page.evaluate("() => { window.stop(); }")
-        except Exception:
-            pass
+                # Wait briefly so handle_response has time to fire and populate total_entries
+                await page.wait_for_timeout(2000)
+                total = ctx.get("segment_total_entries")
+                print(f"[Segment] {seg_label} → total_entries={total}")
 
+                if total is not None and total > PEOPLE_LIMIT:
+                    # ── Level 2: split by job title ──────────────────────────────
+                    print(f"[Segment] {seg_label} exceeds {PEOPLE_LIMIT} — splitting by job title")
+                    for title_group in JOB_TITLE_SEGMENTS:
+                        title_label = f"seniority={seniority_group} titles={title_group}"
+                        title_url = build_people_url_segmented(
+                            org_id,
+                            seniorities=seniority_group,
+                            titles=title_group,
+                        )
+                        await _paginate_people_url(page, title_url, ctx, title_label)
+                else:
+                    # ── Level 1 only: paginate this seniority group ──────────────
+                    await human_idle(page, min_ms=360, max_ms=540)
+                    while True:
+                        result, reason = await click_next_pagination(page)
+                        print("click_next_pagination:", result, reason)
+                        if "not found" in reason.lower() or "disabled" in reason.lower():
+                            break
+                        await asyncio.sleep(1)
+                    try:
+                        await page.evaluate("() => { window.stop(); }")
+                    except Exception:
+                        pass
+
+        # ── Mark company done ────────────────────────────────────────────────────
         if ctx.get("mode") == "new_person":
             await end_new_person_company(company_id, True)
             print(f"[new_person] Set flag1=1 (success) for company_id={company_id}")
@@ -864,13 +1009,11 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             await end_company(company_id)
             print(f"Set modified_time for company_id={company_id}")
 
-        # await page.screenshot(path="apollo_people_page_after_next.png", full_page=True)
-        # print("Saved: apollo_people_page_after_next.png")
-
-        print("Old logic finished.")
+        print("Segmented scrape finished.")
         return True, "OK"
     finally:
         ctx["current_company_id"] = None
+        ctx["segment_total_entries"] = None
 
 
 def parse_args():
@@ -914,6 +1057,7 @@ async def main():
         "last_cf_solved_at": time.time(),  # treat startup as a fresh solve
         "mode": args.mode,
         "company_info_logged": set(),       # tracks company_ids already logged in get_company mode
+        "segment_total_entries": None,      # populated by handle_response for the first page of each segment
     }
 
     async with async_playwright() as p:
@@ -946,7 +1090,7 @@ async def main():
 
         page = await context.new_page()
         print(f"[DEBUG] Open pages: {len(context.pages)}")
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
         async def handle_request(request):
             try:
                 if not is_interesting_request(request.url, request.resource_type):
@@ -1046,6 +1190,14 @@ async def main():
                     data = json.loads(body_text)
                 except json.JSONDecodeError:
                     return
+
+                # Capture total_entries from the first page of each segment so the
+                # navigation logic can decide whether to sub-segment further.
+                pagination = data.get("pagination") or {}
+                total_entries = pagination.get("total_entries")
+                if total_entries is not None and ctx.get("segment_total_entries") is None:
+                    ctx["segment_total_entries"] = total_entries
+                    print(f"[Segment] total_entries={total_entries} (limit={PEOPLE_LIMIT})")
 
                 people = data.get("people", [])
                 if not people:
@@ -1165,7 +1317,7 @@ async def main():
                                 await end_new_person_company(company_id, False)
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id}: {e}")
-                            await asyncio.sleep(random.randint(2, 5))
+                            await asyncio.sleep(1)
                             print("Returning to home page for next target...")
                             await page.goto("about:blank")
                             await page.goto(HOME_URL, wait_until="domcontentloaded")
@@ -1186,7 +1338,7 @@ async def main():
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                        await asyncio.sleep(random.randint(2, 5))
+                        await asyncio.sleep(1)
                         print("Returning to home page for next target...")
                         await page.goto("about:blank")
                         await page.goto(HOME_URL, wait_until="domcontentloaded")
@@ -1308,7 +1460,7 @@ async def main():
                                     except Exception as e:
                                         print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                await asyncio.sleep(random.randint(2, 5))
+                await asyncio.sleep(random.randint(1, 3))
                 # Blank the page first to stop all lingering JS/React before reloading home.
                 print("Returning to home page for next target...")
                 await page.goto("about:blank")
