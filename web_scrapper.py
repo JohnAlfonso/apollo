@@ -891,13 +891,13 @@ def parse_args():
             "get_company: capture company profile info only (name, phone, industry, address, etc.)."
         ),
     )
-    _headless_str = os.environ.get("HEADLESS", "false")
+    _headless_str = os.environ.get("HEADLESS", "true")
     parser.add_argument(
         "--headless",
         type=lambda v: v.lower() not in ("0", "false", "no"),
         default=_headless_str.lower() not in ("0", "false", "no"),
         metavar="BOOL",
-        help="Run browser in headless mode (default: false). Pass --headless true to hide UI.",
+        help="Run browser in headless mode (default: true). Pass --headless false to show UI.",
     )
     return parser.parse_args()
 
