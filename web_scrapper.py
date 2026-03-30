@@ -1545,6 +1545,10 @@ async def run_worker(worker_id: int, args) -> None:
             await page.pause()
             await browser.close()
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print(f"[W{worker_id}] Interrupted — reporting done.")
+        await report_worker_status(worker_id, ip, "done")
+        raise
     except Exception as _worker_exc:
         print(f"[W{worker_id}] Unhandled exception: {_worker_exc}")
         await report_worker_status(worker_id, ip, "error")
@@ -1556,11 +1560,14 @@ async def main():
     if not Path(STATE_FILE).exists():
         raise FileNotFoundError(f"{STATE_FILE} not found. Run save_apollo_state.py first.")
 
-    if args.workers <= 1:
-        await run_worker(0, args)
-    else:
-        print(f"Starting {args.workers} workers with 30s stagger...")
-        await asyncio.gather(*(run_worker(i, args) for i in range(args.workers)))
+    try:
+        if args.workers <= 1:
+            await run_worker(0, args)
+        else:
+            print(f"Starting {args.workers} workers with 30s stagger...")
+            await asyncio.gather(*(run_worker(i, args) for i in range(args.workers)))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n[Main] Shutdown requested. All workers reported their final status.")
 
 
 if __name__ == "__main__":
