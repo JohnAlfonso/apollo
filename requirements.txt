@@ -1,2 +1,4 @@
 playwright>=1.40.0
 httpx>=0.25.0
+pyautogui
+pillow
