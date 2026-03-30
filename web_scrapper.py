@@ -606,11 +606,10 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                 if await overlay.count() > 0:
                     await page.mouse.click(593, 450)
                     await page.wait_for_timeout(180)
-                # If overlay is STILL present after both attempts, the page is stuck —
-                # kill the entire process so the user can investigate.
+                # If overlay is STILL present after both attempts, skip this company.
                 if await overlay.count() > 0:
-                    print("Overlay persists after all dismissal attempts — terminating process.")
-                    sys.exit(1)
+                    print("Overlay persists after all dismissal attempts — skipping company.")
+                    return False, "Overlay stuck — company skipped", None
         except Exception as _ov_err:
             print(f"Overlay dismiss attempt failed (non-fatal): {_ov_err}")
 
@@ -1103,7 +1102,7 @@ def parse_args():
 async def run_worker(worker_id: int, args) -> None:
     """Single independent scraper worker. Staggered by worker_id * 30s at startup."""
     if worker_id > 0:
-        delay = worker_id * 60
+        delay = worker_id * 30
         print(f"[W{worker_id}] Waiting {delay}s before starting...")
         await asyncio.sleep(delay)
 
@@ -1548,6 +1547,10 @@ async def run_worker(worker_id: int, args) -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         print(f"[W{worker_id}] Interrupted — reporting done.")
         await report_worker_status(worker_id, ip, "done")
+        raise
+    except SystemExit as _se:
+        print(f"[W{worker_id}] SystemExit({_se.code}) — reporting error.")
+        await report_worker_status(worker_id, ip, "error")
         raise
     except Exception as _worker_exc:
         print(f"[W{worker_id}] Unhandled exception: {_worker_exc}")
