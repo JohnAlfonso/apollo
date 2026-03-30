@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import asyncio
 import json
 import os
@@ -273,6 +273,30 @@ async def end_new_person_company(company_id: int, success: bool) -> None:
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url)
         resp.raise_for_status()
+
+
+async def _get_public_ip() -> str:
+    """Fetch the machine's public IP via ipify.org. Returns '0.0.0.0' on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://api.ipify.org")
+            return resp.text.strip()
+    except Exception as e:
+        print(f"[Worker] Could not fetch public IP: {e}")
+        return "0.0.0.0"
+
+
+async def report_worker_status(worker_id: int, ip: str, status: str) -> None:
+    """Upsert worker status to backend. Fire-and-forget: never raises."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{BACKEND_API_URL}/api/data-apollo/worker-status",
+                json={"worker_id": worker_id, "ip": ip, "status": status},
+            )
+        print(f"[W{worker_id}] Status reported: {status} (ip={ip})")
+    except Exception as e:
+        print(f"[W{worker_id}] Failed to report status '{status}': {e}")
 
 
 async def log_company_info(body_text: str, company_id: int | None) -> None:
@@ -1066,281 +1090,316 @@ def parse_args():
         metavar="BOOL",
         help="Run browser in headless mode (default: true). Pass --headless false to show UI.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("WORKERS", "1")),
+        metavar="N",
+        help="Number of parallel scraper workers (default: 1). Workers stagger startup by 30s each.",
+    )
     return parser.parse_args()
 
 
-async def main():
-    args = parse_args()
-    if not Path(STATE_FILE).exists():
-        raise FileNotFoundError(f"{STATE_FILE} not found. Run save_apollo_state.py first.")
+async def run_worker(worker_id: int, args) -> None:
+    """Single independent scraper worker. Staggered by worker_id * 30s at startup."""
+    if worker_id > 0:
+        delay = worker_id * 30
+        print(f"[W{worker_id}] Waiting {delay}s before starting...")
+        await asyncio.sleep(delay)
 
-    request_logs = []
-    response_logs = []
-    ctx = {
-        "current_company_id": None,
-        "last_cf_solved_at": time.time(),  # treat startup as a fresh solve
-        "mode": args.mode,
-        "company_info_logged": set(),       # tracks company_ids already logged in get_company mode
-        "segment_total_entries": None,      # populated by handle_response for the first page of each segment
-    }
+    print(f"[W{worker_id}] Worker started.")
+    ip = await _get_public_ip()
+    await report_worker_status(worker_id, ip, "running")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=args.headless,
-            slow_mo=100
-        )
+    try:
+        request_logs = []
+        response_logs = []
+        ctx = {
+            "current_company_id": None,
+            "last_cf_solved_at": time.time(),  # treat startup as a fresh solve
+            "mode": args.mode,
+            "company_info_logged": set(),       # tracks company_ids already logged in get_company mode
+            "segment_total_entries": None,      # populated by handle_response for the first page of each segment
+        }
 
-        context = await browser.new_context(
-            storage_state=STATE_FILE,
-            viewport={"width": 1440, "height": 900},
-            service_workers="block",
-        )
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=args.headless,
+                slow_mo=100
+            )
 
-        # ── Route-level CPU reduction ────────────────────────────────────────
-        # Abort heavy static assets and third-party trackers before they load.
-        # This runs at the network layer — zero rendering cost for blocked URLs.
-        async def _block_route(route):
-            rt = route.request.resource_type
-            url = route.request.url.lower()
-            if rt in BLOCKED_RESOURCE_TYPES:
-                await route.abort()
-                return
-            if any(d in url for d in BLOCKED_DOMAINS):
-                await route.abort()
-                return
-            await route.continue_()
+            context = await browser.new_context(
+                storage_state=STATE_FILE,
+                viewport={"width": 1440, "height": 900},
+                service_workers="block",
+            )
 
-        await context.route("**/*", _block_route)
-
-        page = await context.new_page()
-        print(f"[DEBUG] Open pages: {len(context.pages)}")
-        await asyncio.sleep(1)
-        async def handle_request(request):
-            try:
-                if not is_interesting_request(request.url, request.resource_type):
+            # ── Route-level CPU reduction ────────────────────────────────────────
+            # Abort heavy static assets and third-party trackers before they load.
+            # This runs at the network layer — zero rendering cost for blocked URLs.
+            async def _block_route(route):
+                rt = route.request.resource_type
+                url = route.request.url.lower()
+                if rt in BLOCKED_RESOURCE_TYPES:
+                    await route.abort()
                     return
-
-                headers = await request.all_headers()
-                post_data = request.post_data
-
-                entry = {
-                    "method": request.method,
-                    "url": request.url,
-                    "resource_type": request.resource_type,
-                    "headers": headers,
-                    "post_data": post_data,
-                }
-                request_logs.append(entry)
-
-                if DEBUG_LOG_RESPONSES:
-                    print("\n" + "=" * 100)
-                    print("REQUEST")
-                    print("=" * 100)
-                    print("METHOD:", request.method)
-                    print("URL   :", request.url)
-                    if post_data:
-                        print("POST DATA:", post_data[:3000])
-
-            except Exception as e:
-                print("handle_request error:", e)
-
-        async def handle_response(response):
-            try:
-                request = response.request
-
-                # ── Discovery mode: log every Apollo API call to find new endpoints ──
-                if DISCOVER_ENDPOINTS and "apollo.io" in response.url.lower():
-                    url_l = response.url.lower()
-                    # Only care about XHR / fetch calls, skip static assets
-                    if request.resource_type in ("xhr", "fetch") or "/api/" in url_l:
-                        try:
-                            snippet = (await response.text())[:500]
-                        except Exception:
-                            snippet = "<unreadable>"
-                        print("[DISCOVER] " + "-" * 80)
-                        print(f"[DISCOVER] {request.method} {response.status} {response.url}")
-                        print(f"[DISCOVER] body snippet: {snippet}")
-
-                if not is_interesting_request(response.url, request.resource_type):
+                if any(d in url for d in BLOCKED_DOMAINS):
+                    await route.abort()
                     return
+                await route.continue_()
 
-                url_l = response.url.lower()
+            await context.route("**/*", _block_route)
 
-                # 🔥 HARD FILTER (only process what you REALLY need)
-                if not (
-                    "api/v1/mixed_people/search" in url_l
-                    or "api/v1/organizations/" in url_l
-                ):
-                    return
-
+            page = await context.new_page()
+            print(f"[DEBUG] Open pages: {len(context.pages)}")
+            await asyncio.sleep(1)
+            async def handle_request(request):
                 try:
-                    body_text = await response.text()
-                except Exception:
-                    return
+                    if not is_interesting_request(request.url, request.resource_type):
+                        return
 
-                if DEBUG_LOG_RESPONSES:
-                    response_logs.append({
-                        "url": response.url,
-                        "status": response.status,
-                        "body_text": body_text[:10000] if body_text else None,
-                    })
-                    print("\n" + "=" * 100)
-                    print("RESPONSE", response.status, response.url)
-                    if body_text:
-                        print("BODY:", body_text[:3000])
+                    headers = await request.all_headers()
+                    post_data = request.post_data
 
-                company_id = ctx.get("current_company_id")
-                if company_id is None:
-                    return
+                    entry = {
+                        "method": request.method,
+                        "url": request.url,
+                        "resource_type": request.resource_type,
+                        "headers": headers,
+                        "post_data": post_data,
+                    }
+                    request_logs.append(entry)
 
-                url_l = response.url.lower()
+                    if DEBUG_LOG_RESPONSES:
+                        print("\n" + "=" * 100)
+                        print("REQUEST")
+                        print("=" * 100)
+                        print("METHOD:", request.method)
+                        print("URL   :", request.url)
+                        if post_data:
+                            print("POST DATA:", post_data[:3000])
 
-                # ── Branch: company info (org detail or mixed_companies) ──────────────
-                if "api/v1/organizations/" in url_l or "api/v1/mixed_companies/search" in url_l:
-                    # Only log in get_company mode, and only once per company.
-                    # Add to the set BEFORE awaiting to prevent async race between
-                    # multiple concurrent response events for the same company.
-                    if ctx.get("mode") == "get_company" and company_id not in ctx["company_info_logged"]:
-                        ctx["company_info_logged"].add(company_id)
-                        await log_company_info(body_text, company_id)
-                    return
-
-                # ── Branch: people search pages ───────────────────────────────────────
-                # In get_company mode we only want company info — skip people entirely
-                if ctx.get("mode") == "get_company":
-                    return
-
-                try:
-                    data = json.loads(body_text)
-                except json.JSONDecodeError:
-                    return
-
-                # Capture total_entries from the first page of each segment so the
-                # navigation logic can decide whether to sub-segment further.
-                pagination = data.get("pagination") or {}
-                total_entries = pagination.get("total_entries")
-                if total_entries is not None and ctx.get("segment_total_entries") is None:
-                    ctx["segment_total_entries"] = total_entries
-                    print(f"[Segment] total_entries={total_entries} (limit={PEOPLE_LIMIT})")
-
-                people = data.get("people", [])
-                if not people:
-                    return
-
-                try:
-                    result = await save_apollo_page(company_id, body_text)
-                    inserted = result.get("inserted", 0)
-                    skipped = result.get("skipped", 0)
-                    print(f"[Backend] Saved page for company_id={company_id}: inserted={inserted}, skipped={skipped}")
                 except Exception as e:
-                    print(f"[Backend] Failed to save page for company_id={company_id}: {e}")
+                    print("handle_request error:", e)
 
-            except Exception as e:
-                print("handle_response error:", e)
+            async def handle_response(response):
+                try:
+                    request = response.request
 
-        page.on("request", handle_request)
-        page.on("response", handle_response)
-
-        #################################### step1 HOME ####################################
-        await page.goto(HOME_URL, wait_until="domcontentloaded")
-
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10000)
-        except PlaywrightTimeoutError:
-            print("networkidle timeout; continuing")
-
-        print("Current URL:", page.url)
-
-        if "#/login" in page.url:
-            print("Session expired or invalid.")
-            await browser.close()
-            return
-
-        if not await handle_cloudflare(page, ctx):
-            print("Cloudflare blocked home page. Aborting.")
-            await browser.close()
-            return
-
-        await human_idle(page, min_ms=1200, max_ms=2100)
-
-        batch_num = 0
-        while True:
-            try:
-                if args.mode == "get_company":
-                    rec = await fetch_company_from_queue()
-                    records = [rec] if rec else []
-                elif args.mode == "new_person":
-                    rec = await fetch_new_person_company()
-                    records = [rec] if rec else []
-                else:
-                    records = await fetch_companies(args.sources or None)
-            except Exception as e:
-                print(f"Failed to fetch companies from backend: {e}")
-                break
-
-            if not records:
-                print("No more companies to process.")
-                break
-
-            batch_num += 1
-            print(f"\nBatch {batch_num}: fetched {len(records)} companies")
-
-            for idx, rec in enumerate(records, start=1):
-                # Proactive Cloudflare check — fires at ~55 min to beat the 60-min wall
-                await proactive_cf_check(page, ctx, threshold_minutes=55)
-                company_id = rec.get("id")
-                website = rec.get("website", "")
-                name = rec.get("name", "")
-                company_source = rec.get("source", "")
-
-                company_domain = extract_domain_from_url(website)
-                company_name = name.strip() if name else None
-
-                print("\n" + "#" * 120)
-                print(f"TARGET {idx} (company_id={company_id})")
-                print(f"company_domain = {company_domain}")
-                print(f"company_name   = {company_name}")
-                print(f"company_source = {company_source}")
-                print(f"mode           = {args.mode}")
-                print("#" * 120)
-
-                # get_company needs current_company_id set before search so handle_response
-                # can capture org API responses during navigation to the org page.
-                # add_person / new_person must NOT set it here: Apollo fires a spurious
-                # mixed_people/search when the org overview page loads during the search,
-                # and handle_response would save those unfiltered results.
-                # open_people_page_and_run_old_logic() sets it just-in-time instead.
-                if args.mode == "get_company":
-                    ctx["current_company_id"] = company_id
-
-                # ── new_person fast-path: contact_info.source == "apollo" ─────────────────
-                # When the DB already holds Apollo-sourced company info, the org_id is in
-                # contact_info.companyId.  Build the people URL directly and skip the
-                # Apollo search entirely.
-                if args.mode == "new_person":
-                    contact_info = rec.get("contact_info") or {}
-                    if isinstance(contact_info, str):
-                        try:
-                            contact_info = json.loads(contact_info)
-                        except Exception:
-                            contact_info = {}
-
-                    if contact_info.get("source") == "apollo" and contact_info.get("companyId"):
-                        apollo_org_id = contact_info["companyId"]
-                        people_url = (
-                            f"https://app.apollo.io/#/organizations/{apollo_org_id}/people/"
-                            f"?page=1&sortByField=recommendations_score&sortAscending=false"
-                            f"&personLocations[]=United%20States"
-                        )
-                        print(f"[new_person] Apollo fast-path: org_id={apollo_org_id}, people_url={people_url}")
-
-                        if not await handle_cloudflare(page, ctx):
-                            print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
-                            ctx["current_company_id"] = None
+                    # ── Discovery mode: log every Apollo API call to find new endpoints ──
+                    if DISCOVER_ENDPOINTS and "apollo.io" in response.url.lower():
+                        url_l = response.url.lower()
+                        # Only care about XHR / fetch calls, skip static assets
+                        if request.resource_type in ("xhr", "fetch") or "/api/" in url_l:
                             try:
-                                await end_new_person_company(company_id, False)
-                            except Exception as e:
-                                print(f"Failed to mark company_id={company_id}: {e}")
+                                snippet = (await response.text())[:500]
+                            except Exception:
+                                snippet = "<unreadable>"
+                            print("[DISCOVER] " + "-" * 80)
+                            print(f"[DISCOVER] {request.method} {response.status} {response.url}")
+                            print(f"[DISCOVER] body snippet: {snippet}")
+
+                    if not is_interesting_request(response.url, request.resource_type):
+                        return
+
+                    url_l = response.url.lower()
+
+                    # 🔥 HARD FILTER (only process what you REALLY need)
+                    if not (
+                        "api/v1/mixed_people/search" in url_l
+                        or "api/v1/organizations/" in url_l
+                    ):
+                        return
+
+                    try:
+                        body_text = await response.text()
+                    except Exception:
+                        return
+
+                    if DEBUG_LOG_RESPONSES:
+                        response_logs.append({
+                            "url": response.url,
+                            "status": response.status,
+                            "body_text": body_text[:10000] if body_text else None,
+                        })
+                        print("\n" + "=" * 100)
+                        print("RESPONSE", response.status, response.url)
+                        if body_text:
+                            print("BODY:", body_text[:3000])
+
+                    company_id = ctx.get("current_company_id")
+                    if company_id is None:
+                        return
+
+                    url_l = response.url.lower()
+
+                    # ── Branch: company info (org detail or mixed_companies) ──────────────
+                    if "api/v1/organizations/" in url_l or "api/v1/mixed_companies/search" in url_l:
+                        # Only log in get_company mode, and only once per company.
+                        # Add to the set BEFORE awaiting to prevent async race between
+                        # multiple concurrent response events for the same company.
+                        if ctx.get("mode") == "get_company" and company_id not in ctx["company_info_logged"]:
+                            ctx["company_info_logged"].add(company_id)
+                            await log_company_info(body_text, company_id)
+                        return
+
+                    # ── Branch: people search pages ───────────────────────────────────────
+                    # In get_company mode we only want company info — skip people entirely
+                    if ctx.get("mode") == "get_company":
+                        return
+
+                    try:
+                        data = json.loads(body_text)
+                    except json.JSONDecodeError:
+                        return
+
+                    # Capture total_entries from the first page of each segment so the
+                    # navigation logic can decide whether to sub-segment further.
+                    pagination = data.get("pagination") or {}
+                    total_entries = pagination.get("total_entries")
+                    if total_entries is not None and ctx.get("segment_total_entries") is None:
+                        ctx["segment_total_entries"] = total_entries
+                        print(f"[Segment] total_entries={total_entries} (limit={PEOPLE_LIMIT})")
+
+                    people = data.get("people", [])
+                    if not people:
+                        return
+
+                    try:
+                        result = await save_apollo_page(company_id, body_text)
+                        inserted = result.get("inserted", 0)
+                        skipped = result.get("skipped", 0)
+                        print(f"[Backend] Saved page for company_id={company_id}: inserted={inserted}, skipped={skipped}")
+                    except Exception as e:
+                        print(f"[Backend] Failed to save page for company_id={company_id}: {e}")
+
+                except Exception as e:
+                    print("handle_response error:", e)
+
+            page.on("request", handle_request)
+            page.on("response", handle_response)
+
+            #################################### step1 HOME ####################################
+            await page.goto(HOME_URL, wait_until="domcontentloaded")
+
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                print("networkidle timeout; continuing")
+
+            print("Current URL:", page.url)
+
+            if "#/login" in page.url:
+                print("Session expired or invalid.")
+                await browser.close()
+                return
+
+            if not await handle_cloudflare(page, ctx):
+                print("Cloudflare blocked home page. Aborting.")
+                await browser.close()
+                return
+
+            await human_idle(page, min_ms=1200, max_ms=2100)
+
+            batch_num = 0
+            while True:
+                try:
+                    if args.mode == "get_company":
+                        rec = await fetch_company_from_queue()
+                        records = [rec] if rec else []
+                    elif args.mode == "new_person":
+                        rec = await fetch_new_person_company()
+                        records = [rec] if rec else []
+                    else:
+                        records = await fetch_companies(args.sources or None)
+                except Exception as e:
+                    print(f"Failed to fetch companies from backend: {e}")
+                    break
+
+                if not records:
+                    print("No more companies to process.")
+                    break
+
+                batch_num += 1
+                print(f"\n[W{worker_id}] Batch {batch_num}: fetched {len(records)} companies")
+
+                for idx, rec in enumerate(records, start=1):
+                    # Proactive Cloudflare check — fires at ~55 min to beat the 60-min wall
+                    await proactive_cf_check(page, ctx, threshold_minutes=55)
+                    company_id = rec.get("id")
+                    website = rec.get("website", "")
+                    name = rec.get("name", "")
+                    company_source = rec.get("source", "")
+
+                    company_domain = extract_domain_from_url(website)
+                    company_name = name.strip() if name else None
+
+                    print("\n" + "#" * 120)
+                    print(f"[W{worker_id}] TARGET {idx} (company_id={company_id})")
+                    print(f"company_domain = {company_domain}")
+                    print(f"company_name   = {company_name}")
+                    print(f"company_source = {company_source}")
+                    print(f"mode           = {args.mode}")
+                    print("#" * 120)
+
+                    # get_company needs current_company_id set before search so handle_response
+                    # can capture org API responses during navigation to the org page.
+                    # add_person / new_person must NOT set it here: Apollo fires a spurious
+                    # mixed_people/search when the org overview page loads during the search,
+                    # and handle_response would save those unfiltered results.
+                    # open_people_page_and_run_old_logic() sets it just-in-time instead.
+                    if args.mode == "get_company":
+                        ctx["current_company_id"] = company_id
+
+                    # ── new_person fast-path: contact_info.source == "apollo" ─────────────────
+                    # When the DB already holds Apollo-sourced company info, the org_id is in
+                    # contact_info.companyId.  Build the people URL directly and skip the
+                    # Apollo search entirely.
+                    if args.mode == "new_person":
+                        contact_info = rec.get("contact_info") or {}
+                        if isinstance(contact_info, str):
+                            try:
+                                contact_info = json.loads(contact_info)
+                            except Exception:
+                                contact_info = {}
+
+                        if contact_info.get("source") == "apollo" and contact_info.get("companyId"):
+                            apollo_org_id = contact_info["companyId"]
+                            people_url = (
+                                f"https://app.apollo.io/#/organizations/{apollo_org_id}/people/"
+                                f"?page=1&sortByField=recommendations_score&sortAscending=false"
+                                f"&personLocations[]=United%20States"
+                            )
+                            print(f"[new_person] Apollo fast-path: org_id={apollo_org_id}, people_url={people_url}")
+
+                            if not await handle_cloudflare(page, ctx):
+                                print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
+                                ctx["current_company_id"] = None
+                                try:
+                                    await end_new_person_company(company_id, False)
+                                except Exception as e:
+                                    print(f"Failed to mark company_id={company_id}: {e}")
+                                await asyncio.sleep(1)
+                                print("Returning to home page for next target...")
+                                await page.goto("about:blank")
+                                await page.goto(HOME_URL, wait_until="domcontentloaded")
+                                try:
+                                    await page.wait_for_load_state("networkidle", timeout=10000)
+                                except PlaywrightTimeoutError:
+                                    pass
+                                await handle_cloudflare(page, ctx)
+                                await human_idle(page, min_ms=600, max_ms=1200)
+                                continue
+
+                            ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
+                            print("open_people_page_and_run_old_logic:", ok, msg)
+                            if not ok:
+                                print(f"People page failed for company_id={company_id}: {msg}")
+                                try:
+                                    await end_new_person_company(company_id, False)
+                                except Exception as e:
+                                    print(f"Failed to mark company_id={company_id} as failed: {e}")
+
                             await asyncio.sleep(1)
                             print("Returning to home page for next target...")
                             await page.goto("about:blank")
@@ -1351,119 +1410,86 @@ async def main():
                                 pass
                             await handle_cloudflare(page, ctx)
                             await human_idle(page, min_ms=600, max_ms=1200)
-                            continue
+                            continue  # skip the search block below
 
-                        ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
-                        print("open_people_page_and_run_old_logic:", ok, msg)
-                        if not ok:
-                            print(f"People page failed for company_id={company_id}: {msg}")
-                            try:
-                                await end_new_person_company(company_id, False)
-                            except Exception as e:
-                                print(f"Failed to mark company_id={company_id} as failed: {e}")
-
-                        await asyncio.sleep(1)
-                        print("Returning to home page for next target...")
-                        await page.goto("about:blank")
-                        await page.goto(HOME_URL, wait_until="domcontentloaded")
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=10000)
-                        except PlaywrightTimeoutError:
-                            pass
-                        await handle_cloudflare(page, ctx)
-                        await human_idle(page, min_ms=600, max_ms=1200)
-                        continue  # skip the search block below
-
-                # Check for Cloudflare before attempting to search
-                if not await handle_cloudflare(page, ctx):
-                    print(f"Cloudflare blocked search for company_id={company_id}. Skipping.")
-                    ctx["current_company_id"] = None
-                    try:
-                        if args.mode == "get_company":
-                            await end_company_queue(company_id)
-                        elif args.mode == "new_person":
-                            await end_new_person_company(company_id, False)
-                        else:
-                            await end_company(company_id)
-                    except Exception as e:
-                        print(f"Failed to mark company_id={company_id}: {e}")
-                    continue
-
-                _search_retry = 0
-                while True:
-                    result, reason, company_url = await search_company_on_searchtag(
-                        page,
-                        company_domain=company_domain,
-                        company_name=company_name
-                    )
-
-                    print("search_company_on_searchtag:", result, reason, company_url)
-
-                    if not result and reason == "Search input not found":
-                        _search_retry += 1
-                        if _search_retry >= 5:
-                            print("Search input still not found after 5 retries. Reloading home page...")
-                            await page.goto("about:blank")
-                            await page.goto(HOME_URL, wait_until="domcontentloaded")
-                            try:
-                                await page.wait_for_load_state("networkidle", timeout=10000)
-                            except PlaywrightTimeoutError:
-                                pass
-                            await handle_cloudflare(page, ctx)
-                            _search_retry = 0
-                        else:
-                            await page.wait_for_timeout(1500)
-                    else:
-                        break
-
-                if not result:
-                    print(f"No matching company found for {company_domain}. Marking company_id={company_id} to avoid infinite retry.")
-                    ctx["current_company_id"] = None
-                    try:
-                        if args.mode == "get_company":
-                            await end_company_queue(company_id)
-                        elif args.mode == "new_person":
-                            await end_new_person_company(company_id, False)
-                        else:
-                            await end_company(company_id)
-                    except Exception as e:
-                        print(f"Failed to mark company_id={company_id}: {e}")
-                    continue
-
-                # ── Mode: get_company ────────────────────────────────────────────────────
-                # Company info was captured automatically by handle_response when Apollo's
-                # api/v1/organizations/ endpoint fired while search_company_on_searchtag
-                # navigated to the org page.  Just wait briefly for in-flight responses,
-                # mark the company done, then move on.
-                if args.mode == "get_company":
-                    await page.wait_for_timeout(random.randint(450, 900))
-                    try:
-                        await end_company_queue(company_id)
-                        print(f"[get_company] Marked company_id={company_id} as done.")
-                    except Exception as e:
-                        print(f"[get_company] Failed to mark company_id={company_id}: {e}")
-                    finally:
-                        ctx["current_company_id"] = None
-
-                # ── Mode: add_person / new_person ────────────────────────────────────────
-                else:
-                    people_url = build_people_url_from_company_url(company_url or page.url)
-                    print("Derived people URL:", people_url)
-
-                    if not people_url:
-                        print(f"Could not derive people URL from company page. Marking company_id={company_id} to avoid infinite retry.")
+                    # Check for Cloudflare before attempting to search
+                    if not await handle_cloudflare(page, ctx):
+                        print(f"Cloudflare blocked search for company_id={company_id}. Skipping.")
                         ctx["current_company_id"] = None
                         try:
-                            if args.mode == "new_person":
+                            if args.mode == "get_company":
+                                await end_company_queue(company_id)
+                            elif args.mode == "new_person":
                                 await end_new_person_company(company_id, False)
                             else:
                                 await end_company(company_id)
                         except Exception as e:
                             print(f"Failed to mark company_id={company_id}: {e}")
+                        continue
+
+                    _search_retry = 0
+                    while True:
+                        result, reason, company_url = await search_company_on_searchtag(
+                            page,
+                            company_domain=company_domain,
+                            company_name=company_name
+                        )
+
+                        print("search_company_on_searchtag:", result, reason, company_url)
+
+                        if not result and reason == "Search input not found":
+                            _search_retry += 1
+                            if _search_retry >= 5:
+                                print("Search input still not found after 5 retries. Reloading home page...")
+                                await page.goto("about:blank")
+                                await page.goto(HOME_URL, wait_until="domcontentloaded")
+                                try:
+                                    await page.wait_for_load_state("networkidle", timeout=10000)
+                                except PlaywrightTimeoutError:
+                                    pass
+                                await handle_cloudflare(page, ctx)
+                                _search_retry = 0
+                            else:
+                                await page.wait_for_timeout(1500)
+                        else:
+                            break
+
+                    if not result:
+                        print(f"No matching company found for {company_domain}. Marking company_id={company_id} to avoid infinite retry.")
+                        ctx["current_company_id"] = None
+                        try:
+                            if args.mode == "get_company":
+                                await end_company_queue(company_id)
+                            elif args.mode == "new_person":
+                                await end_new_person_company(company_id, False)
+                            else:
+                                await end_company(company_id)
+                        except Exception as e:
+                            print(f"Failed to mark company_id={company_id}: {e}")
+                        continue
+
+                    # ── Mode: get_company ────────────────────────────────────────────────────
+                    # Company info was captured automatically by handle_response when Apollo's
+                    # api/v1/organizations/ endpoint fired while search_company_on_searchtag
+                    # navigated to the org page.  Just wait briefly for in-flight responses,
+                    # mark the company done, then move on.
+                    if args.mode == "get_company":
+                        await page.wait_for_timeout(random.randint(450, 900))
+                        try:
+                            await end_company_queue(company_id)
+                            print(f"[get_company] Marked company_id={company_id} as done.")
+                        except Exception as e:
+                            print(f"[get_company] Failed to mark company_id={company_id}: {e}")
+                        finally:
+                            ctx["current_company_id"] = None
+
+                    # ── Mode: add_person / new_person ────────────────────────────────────────
                     else:
-                        # Check for Cloudflare before opening people page
-                        if not await handle_cloudflare(page, ctx):
-                            print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
+                        people_url = build_people_url_from_company_url(company_url or page.url)
+                        print("Derived people URL:", people_url)
+
+                        if not people_url:
+                            print(f"Could not derive people URL from company page. Marking company_id={company_id} to avoid infinite retry.")
                             ctx["current_company_id"] = None
                             try:
                                 if args.mode == "new_person":
@@ -1473,38 +1499,68 @@ async def main():
                             except Exception as e:
                                 print(f"Failed to mark company_id={company_id}: {e}")
                         else:
-                            ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
-                            print("open_people_page_and_run_old_logic:", ok, msg)
-
-                            if not ok:
-                                print(f"People page failed for company_id={company_id}: {msg}")
-                                if args.mode == "new_person":
-                                    try:
+                            # Check for Cloudflare before opening people page
+                            if not await handle_cloudflare(page, ctx):
+                                print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
+                                ctx["current_company_id"] = None
+                                try:
+                                    if args.mode == "new_person":
                                         await end_new_person_company(company_id, False)
-                                    except Exception as e:
-                                        print(f"Failed to mark company_id={company_id} as failed: {e}")
+                                    else:
+                                        await end_company(company_id)
+                                except Exception as e:
+                                    print(f"Failed to mark company_id={company_id}: {e}")
+                            else:
+                                ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
+                                print("open_people_page_and_run_old_logic:", ok, msg)
 
-                await asyncio.sleep(random.randint(1, 3))
-                # Blank the page first to stop all lingering JS/React before reloading home.
-                print("Returning to home page for next target...")
-                await page.goto("about:blank")
-                await page.goto(HOME_URL, wait_until="domcontentloaded")
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                except PlaywrightTimeoutError:
-                    print("networkidle timeout when returning home; continuing")
+                                if not ok:
+                                    print(f"People page failed for company_id={company_id}: {msg}")
+                                    if args.mode == "new_person":
+                                        try:
+                                            await end_new_person_company(company_id, False)
+                                        except Exception as e:
+                                            print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                await handle_cloudflare(page, ctx)
-                await human_idle(page, min_ms=600, max_ms=1200)
-                print(f"[DEBUG] Open pages: {len(context.pages)}")
+                    await asyncio.sleep(random.randint(1, 3))
+                    # Blank the page first to stop all lingering JS/React before reloading home.
+                    print("Returning to home page for next target...")
+                    await page.goto("about:blank")
+                    await page.goto(HOME_URL, wait_until="domcontentloaded")
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except PlaywrightTimeoutError:
+                        print("networkidle timeout when returning home; continuing")
 
-        if DEBUG_LOG_RESPONSES:
-            await dump_json(REQUEST_LOG_FILE, request_logs)
-            await dump_json(RESPONSE_LOG_FILE, response_logs)
+                    await handle_cloudflare(page, ctx)
+                    await human_idle(page, min_ms=600, max_ms=1200)
+                    print(f"[DEBUG] Open pages: {len(context.pages)}")
 
-        print("All done.")
-        await page.pause()
-        await browser.close()
+            if DEBUG_LOG_RESPONSES:
+                await dump_json(REQUEST_LOG_FILE, request_logs)
+                await dump_json(RESPONSE_LOG_FILE, response_logs)
+
+            print(f"[W{worker_id}] All done.")
+            await report_worker_status(worker_id, ip, "done")
+            await page.pause()
+            await browser.close()
+
+    except Exception as _worker_exc:
+        print(f"[W{worker_id}] Unhandled exception: {_worker_exc}")
+        await report_worker_status(worker_id, ip, "error")
+        raise
+
+
+async def main():
+    args = parse_args()
+    if not Path(STATE_FILE).exists():
+        raise FileNotFoundError(f"{STATE_FILE} not found. Run save_apollo_state.py first.")
+
+    if args.workers <= 1:
+        await run_worker(0, args)
+    else:
+        print(f"Starting {args.workers} workers with 30s stagger...")
+        await asyncio.gather(*(run_worker(i, args) for i in range(args.workers)))
 
 
 if __name__ == "__main__":
