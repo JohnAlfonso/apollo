@@ -1103,7 +1103,7 @@ def parse_args():
 async def run_worker(worker_id: int, args) -> None:
     """Single independent scraper worker. Staggered by worker_id * 30s at startup."""
     if worker_id > 0:
-        delay = worker_id * 30
+        delay = worker_id * 60
         print(f"[W{worker_id}] Waiting {delay}s before starting...")
         await asyncio.sleep(delay)
 
