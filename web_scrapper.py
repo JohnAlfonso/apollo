@@ -1147,15 +1147,18 @@ async def run_worker(worker_id: int, args) -> None:
             # Abort heavy static assets and third-party trackers before they load.
             # This runs at the network layer — zero rendering cost for blocked URLs.
             async def _block_route(route):
-                rt = route.request.resource_type
-                url = route.request.url.lower()
-                if rt in BLOCKED_RESOURCE_TYPES:
-                    await route.abort()
-                    return
-                if any(d in url for d in BLOCKED_DOMAINS):
-                    await route.abort()
-                    return
-                await route.continue_()
+                try:
+                    rt = route.request.resource_type
+                    url = route.request.url.lower()
+                    if rt in BLOCKED_RESOURCE_TYPES:
+                        await route.abort()
+                        return
+                    if any(d in url for d in BLOCKED_DOMAINS):
+                        await route.abort()
+                        return
+                    await route.continue_()
+                except Exception:
+                    pass  # Page/browser closed mid-request — safe to ignore
 
             await context.route("**/*", _block_route)
 
@@ -1534,12 +1537,21 @@ async def run_worker(worker_id: int, args) -> None:
                     await asyncio.sleep(random.randint(1, 3))
                     # Blank the page first to stop all lingering JS/React before reloading home.
                     print("Returning to home page for next target...")
-                    await page.goto("about:blank")
-                    await page.goto(HOME_URL, wait_until="domcontentloaded")
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=10000)
+                        await page.goto("about:blank")
+                    except Exception:
+                        pass
+                    try:
+                        await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
                     except PlaywrightTimeoutError:
                         print("networkidle timeout when returning home; continuing")
+                    except Exception as _goto_err:
+                        print(f"page.goto HOME_URL failed: {_goto_err} — continuing")
+                    else:
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=10000)
+                        except PlaywrightTimeoutError:
+                            print("networkidle timeout when returning home; continuing")
 
                     await handle_cloudflare(page, ctx)
                     await human_idle(page, min_ms=600, max_ms=1200)
