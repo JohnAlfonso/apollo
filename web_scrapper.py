@@ -513,7 +513,14 @@ async def proactive_cf_check(page, ctx: dict, threshold_minutes: int = 55) -> No
           f"(threshold={threshold_minutes} min). Performing proactive check...")
 
     # Navigate to home to trigger the challenge in a safe, predictable place
-    await page.goto(HOME_URL, wait_until="domcontentloaded")
+    try:
+        await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
+    except PlaywrightTimeoutError:
+        print("[CF Timer] page.goto timed out during proactive check — skipping.")
+        return
+    except Exception as e:
+        print(f"[CF Timer] page.goto failed during proactive check: {e} — skipping.")
+        return
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
     except PlaywrightTimeoutError:
