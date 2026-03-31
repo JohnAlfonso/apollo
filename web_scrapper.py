@@ -595,21 +595,24 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     try:
         # Dismiss any Apollo modal/overlay (e.g. "What's new", profile prompt, or any
         # leftover dialog) that would intercept pointer events and make hover time out.
-        # Apollo portals these as <div data-open="true" role="presentation" data-backdrop=…>
+        # Only target elements that are TRUE blocking modals: they have a backdrop attribute.
+        # The generic [data-open='true'][role='presentation'] also matches permanent nav/sidebar
+        # elements that are always present — those must NOT be treated as blocking.
         try:
-            overlay = page.locator("[data-open='true'][role='presentation']")
-            if await overlay.count() > 0:
+            overlay = page.locator("[data-open='true'][role='presentation'][data-backdrop]")
+            if await overlay.count() > 0 and await overlay.first.is_visible():
                 print("Apollo modal overlay detected — pressing Escape to dismiss...")
                 await page.keyboard.press("Escape")
-                await page.wait_for_timeout(180)
+                await page.wait_for_timeout(300)
                 # Still present? Click in the top-left corner (always outside any modal)
-                if await overlay.count() > 0:
-                    await page.mouse.click(593, 450)
-                    await page.wait_for_timeout(180)
-                # If overlay is STILL present after both attempts, skip this company.
-                if await overlay.count() > 0:
-                    print("Overlay persists after all dismissal attempts — skipping company.")
-                    return False, "Overlay stuck — company skipped", None
+                if await overlay.count() > 0 and await overlay.first.is_visible():
+                    await page.mouse.click(20, 20)
+                    await page.wait_for_timeout(300)
+                # If still present: exit with code 2 so orchestrator.py can
+                # run auto_antibot.py and restart the scraper automatically.
+                if await overlay.count() > 0 and await overlay.first.is_visible():
+                    print("Overlay persists after all dismissal attempts — exiting with code 2 for orchestrator.")
+                    sys.exit(2)
         except Exception as _ov_err:
             print(f"Overlay dismiss attempt failed (non-fatal): {_ov_err}")
 
