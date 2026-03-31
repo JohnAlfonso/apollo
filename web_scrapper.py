@@ -1292,8 +1292,12 @@ async def run_worker(worker_id: int, args) -> None:
             page.on("response", handle_response)
 
             #################################### step1 HOME ####################################
-            await page.goto(HOME_URL, wait_until="domcontentloaded")
-
+            try:
+                await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
+            except PlaywrightTimeoutError:
+                print("networkidle timeout on initial home load; continuing")
+            except Exception as _e:
+                print(f"page.goto HOME_URL (initial) failed: {_e} — continuing")
             try:
                 await page.wait_for_load_state("networkidle", timeout=10000)
             except PlaywrightTimeoutError:
@@ -1393,12 +1397,17 @@ async def run_worker(worker_id: int, args) -> None:
                                     print(f"Failed to mark company_id={company_id}: {e}")
                                 await asyncio.sleep(1)
                                 print("Returning to home page for next target...")
-                                await page.goto("about:blank")
-                                await page.goto(HOME_URL, wait_until="domcontentloaded")
                                 try:
+                                    await page.goto("about:blank")
+                                except Exception:
+                                    pass
+                                try:
+                                    await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
                                     await page.wait_for_load_state("networkidle", timeout=10000)
                                 except PlaywrightTimeoutError:
-                                    pass
+                                    print("networkidle timeout when returning home; continuing")
+                                except Exception as _e:
+                                    print(f"page.goto HOME_URL failed: {_e} — continuing")
                                 await handle_cloudflare(page, ctx)
                                 await human_idle(page, min_ms=600, max_ms=1200)
                                 continue
@@ -1414,12 +1423,17 @@ async def run_worker(worker_id: int, args) -> None:
 
                             await asyncio.sleep(1)
                             print("Returning to home page for next target...")
-                            await page.goto("about:blank")
-                            await page.goto(HOME_URL, wait_until="domcontentloaded")
                             try:
+                                await page.goto("about:blank")
+                            except Exception:
+                                pass
+                            try:
+                                await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
                                 await page.wait_for_load_state("networkidle", timeout=10000)
                             except PlaywrightTimeoutError:
-                                pass
+                                print("networkidle timeout when returning home; continuing")
+                            except Exception as _e:
+                                print(f"page.goto HOME_URL failed: {_e} — continuing")
                             await handle_cloudflare(page, ctx)
                             await human_idle(page, min_ms=600, max_ms=1200)
                             continue  # skip the search block below
@@ -1453,12 +1467,17 @@ async def run_worker(worker_id: int, args) -> None:
                             _search_retry += 1
                             if _search_retry >= 5:
                                 print("Search input still not found after 5 retries. Reloading home page...")
-                                await page.goto("about:blank")
-                                await page.goto(HOME_URL, wait_until="domcontentloaded")
                                 try:
+                                    await page.goto("about:blank")
+                                except Exception:
+                                    pass
+                                try:
+                                    await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
                                     await page.wait_for_load_state("networkidle", timeout=10000)
                                 except PlaywrightTimeoutError:
-                                    pass
+                                    print("networkidle timeout when reloading home for search retry; continuing")
+                                except Exception as _e:
+                                    print(f"page.goto HOME_URL failed on search retry: {_e} — continuing")
                                 await handle_cloudflare(page, ctx)
                                 _search_retry = 0
                             else:
@@ -1564,6 +1583,10 @@ async def run_worker(worker_id: int, args) -> None:
             print(f"[W{worker_id}] All done.")
             await report_worker_status(worker_id, ip, "done")
             await page.pause()
+            try:
+                await context.unroute_all(behavior="ignoreErrors")
+            except Exception:
+                pass
             await browser.close()
 
     except (KeyboardInterrupt, asyncio.CancelledError):
