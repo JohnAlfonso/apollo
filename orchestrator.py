@@ -99,7 +99,8 @@ def main() -> None:
                 print(f"[{_timestamp()}] [Orchestrator] "
                       "Overlay detected (exit 2) — running auto_antibot.py then restarting.")
                 run_antibot()
-                # Restart immediately — no pause needed.
+                print(f"[{_timestamp()}] [Orchestrator] Waiting 10s before restarting ...")
+                time.sleep(10)
                 continue
 
             if exit_code == 0:
