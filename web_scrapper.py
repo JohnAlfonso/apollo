@@ -1106,6 +1106,13 @@ def parse_args():
         metavar="N",
         help="Number of parallel scraper workers (default: 1). Workers stagger startup by 30s each.",
     )
+    parser.add_argument(
+        "--worker_index",
+        type=int,
+        default=int(os.environ.get("WORKER_INDEX", "0")),
+        metavar="N",
+        help="Index of the current worker (default: 0). Used for staggering startup.",
+    )
     return parser.parse_args()
 
 
@@ -1610,7 +1617,7 @@ async def main():
 
     try:
         if args.workers <= 1:
-            await run_worker(0, args)
+            await run_worker(0 + args.worker_index, args)
         else:
             print(f"Starting {args.workers} workers with 30s stagger...")
             await asyncio.gather(*(run_worker(i, args) for i in range(args.workers)))
