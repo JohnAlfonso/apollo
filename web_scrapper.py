@@ -1011,11 +1011,12 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
 
             await page.wait_for_timeout(2000)
             total = ctx.get("segment_total_entries")
+            _limit = ctx.get("people_limit", PEOPLE_LIMIT)
             print(f"[Segment] Unsegmented total_entries={total}")
 
-            if total is None or total <= PEOPLE_LIMIT:
+            if total is None or total <= _limit:
                 # ── Within limit: paginate the already-loaded unsegmented page ───
-                print(f"[Segment] total={total} ≤ {PEOPLE_LIMIT} — paginating without filters")
+                print(f"[Segment] total={total} ≤ {_limit} — paginating without filters")
                 await human_idle(page, min_ms=360, max_ms=540)
                 while True:
                     if _shutdown_requested[0]:  # Risk 3+4: fast exit mid-pagination
@@ -1032,7 +1033,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     pass
             else:
                 # ── Over limit: apply Level 1 seniority segmentation ─────────────
-                print(f"[Segment] total={total} > {PEOPLE_LIMIT} — applying seniority segmentation")
+                print(f"[Segment] total={total} > {_limit} — applying seniority segmentation")
                 for seniority_group in SENIORITY_SEGMENTS:
                     seg_label = f"seniority={seniority_group}"
                     seg_url = build_people_url_segmented(org_id, seniorities=seniority_group)
@@ -1051,9 +1052,9 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     seg_total = ctx.get("segment_total_entries")
                     print(f"[Segment] {seg_label} → total_entries={seg_total}")
 
-                    if seg_total is not None and seg_total > PEOPLE_LIMIT:
+                    if seg_total is not None and seg_total > _limit:
                         # ── Level 2: split by job title ──────────────────────────
-                        print(f"[Segment] {seg_label} exceeds {PEOPLE_LIMIT} — splitting by job title")
+                        print(f"[Segment] {seg_label} exceeds {_limit} — splitting by job title")
                         for title_group in JOB_TITLE_SEGMENTS:
                             title_label = f"seniority={seniority_group} titles={title_group}"
                             title_url = build_people_url_segmented(
@@ -1134,6 +1135,13 @@ def parse_args():
         metavar="N",
         help="Index of the current worker (default: 0). Used for staggering startup.",
     )
+    parser.add_argument(
+        "--people_limit",
+        type=int,
+        default=int(os.environ.get("PEOPLE_LIMIT", str(PEOPLE_LIMIT))),
+        metavar="N",
+        help=f"Apollo result cap per query segment (default: {PEOPLE_LIMIT}). Override when plan limits differ.",
+    )
     return parser.parse_args()
 
 
@@ -1157,6 +1165,7 @@ async def run_worker(worker_id: int, args) -> None:
             "mode": args.mode,
             "company_info_logged": set(),       # tracks company_ids already logged in get_company mode
             "segment_total_entries": None,      # populated by handle_response for the first page of each segment
+            "people_limit": args.people_limit,  # configurable via --people_limit
         }
 
         async with async_playwright() as p:
@@ -1299,7 +1308,7 @@ async def run_worker(worker_id: int, args) -> None:
                     total_entries = pagination.get("total_entries")
                     if total_entries is not None and ctx.get("segment_total_entries") is None:
                         ctx["segment_total_entries"] = total_entries
-                        print(f"[Segment] total_entries={total_entries} (limit={PEOPLE_LIMIT})")
+                        print(f"[Segment] total_entries={total_entries} (limit={ctx.get('people_limit', PEOPLE_LIMIT)})")
 
                     people = data.get("people", [])
                     if not people:
