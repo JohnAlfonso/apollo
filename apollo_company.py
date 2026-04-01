@@ -190,6 +190,15 @@ async def open_people_page_and_run_old_logic(page, people_url: str):
         print("click_next_pagination:", result, reason)
 
         if result:
+            # Next button disabled — natural end of results.
+            break
+
+        if "not found" in reason.lower():
+            # Next button missing — either last page or Cloudflare removed the UI.
+            if await is_cloudflare_blocked(page):
+                print("[Pagination] Cloudflare detected after Next button disappeared — signalling shutdown.")
+                raise _OverlayShutdown()
+            # Genuine end of results.
             break
 
         await asyncio.sleep(random.randint(1, 4))
@@ -380,7 +389,16 @@ async def run_worker(worker_id: int, args) -> None:
                             body_text = await response.text()
                         except Exception:
                             return
-                        search_result = json.loads(body_text)
+                        try:
+                            search_result = json.loads(body_text)
+                        except json.JSONDecodeError:
+                            # Non-JSON body — almost certainly a Cloudflare challenge page.
+                            if "cf-turnstile" in body_text or "challenges.cloudflare.com" in body_text:
+                                print(f"[W{worker_id}] Cloudflare challenge detected in API response — signalling shutdown.")
+                                _shutdown_requested[0] = True
+                            else:
+                                print(f"[W{worker_id}] Non-JSON response from mixed_companies/search (ignored).")
+                            return
                         pagination = search_result.get("pagination", {})
                         if pagination:
                             pagination_search["page"]          = pagination["page"]
