@@ -1,32 +1,37 @@
 """
 orchestrator.py — Automated scraping scheduler.
 
-Runs web_scrapper.py continuously.  No time-based cycling.
+Runs a target scraper script continuously.  No time-based cycling.
 When the scraper exits with code 2 (overlay/Cloudflare detected):
   1. Run auto_antibot.py to solve the Cloudflare checkbox.
-  2. Restart web_scrapper.py immediately.
+  2. Restart the script immediately.
 Any other exit code restarts the scraper directly without antibot.
 
 Usage:
-    python orchestrator.py [any web_scrapper.py args...]
+    python orchestrator.py [--script SCRIPT] [any scraper args...]
 
 Examples:
-    python orchestrator.py
-    python orchestrator.py --mode add_person --sources hunter.io-50-1000
+    python orchestrator.py --script web_scrapper.py --mode add_person --sources hunter.io-50-1000
+    python orchestrator.py --script apollo_company.py --location US --worker_index 0
 """
 
+import argparse
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 # ── Script locations ──────────────────────────────────────────────────────────
-_HERE           = Path(__file__).parent
-SCRAPER_SCRIPT  = _HERE / "web_scrapper.py"
-ANTIBOT_SCRIPT  = _HERE / "auto_antibot.py"
+_HERE          = Path(__file__).parent
+ANTIBOT_SCRIPT = _HERE / "auto_antibot.py"
 
-# Any extra CLI arguments are forwarded directly to web_scrapper.py.
-SCRAPER_EXTRA_ARGS = sys.argv[1:]
+# Parse --script from args; forward everything else to the target scraper.
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--script", default="web_scrapper.py",
+                     help="Scraper script to run (default: web_scrapper.py)")
+_orchestrator_args, SCRAPER_EXTRA_ARGS = _parser.parse_known_args(sys.argv[1:])
+
+SCRAPER_SCRIPT = _HERE / _orchestrator_args.script
 
 
 def _timestamp() -> str:
@@ -52,15 +57,15 @@ def run_antibot() -> None:
 
 
 def run_scraper() -> int:
-    """Start web_scrapper.py and wait until it exits on its own.
+    """Start the target script and wait until it exits on its own.
     Returns the exit code:
-      0  = finished normally (no more companies, or clean shutdown)
+      0  = finished normally (no more work, or clean shutdown)
       2  = overlay/Cloudflare detected — auto_antibot.py must be run first
       other = crashed or killed externally
     """
     cmd = [sys.executable, str(SCRAPER_SCRIPT)] + SCRAPER_EXTRA_ARGS
     print(f"\n{'=' * 70}")
-    print(f"[{_timestamp()}] [Orchestrator] Starting web_scrapper.py")
+    print(f"[{_timestamp()}] [Orchestrator] Starting {SCRAPER_SCRIPT.name}")
     print(f"[{_timestamp()}] [Orchestrator] Command: {' '.join(cmd)}")
     print(f"{'=' * 70}\n")
 
@@ -68,7 +73,7 @@ def run_scraper() -> int:
         proc = subprocess.Popen(cmd)
         proc.wait()
         code = proc.returncode
-        print(f"[{_timestamp()}] [Orchestrator] web_scrapper.py exited (code={code}).")
+        print(f"[{_timestamp()}] [Orchestrator] {SCRAPER_SCRIPT.name} exited (code={code}).")
         return code
     except KeyboardInterrupt:
         print(f"\n[{_timestamp()}] [Orchestrator] KeyboardInterrupt — stopping scraper.")
@@ -85,8 +90,9 @@ def run_scraper() -> int:
 
 def main() -> None:
     print(f"[{_timestamp()}] [Orchestrator] ==========================================")
-    print(f"[{_timestamp()}] [Orchestrator] Scraper args : {SCRAPER_EXTRA_ARGS or '(none)'}")
-    print(f"[{_timestamp()}] [Orchestrator] Exit code 2  : overlay -> antibot -> restart")
+    print(f"[{_timestamp()}] [Orchestrator] Script      : {SCRAPER_SCRIPT.name}")
+    print(f"[{_timestamp()}] [Orchestrator] Scraper args: {SCRAPER_EXTRA_ARGS or '(none)'}")
+    print(f"[{_timestamp()}] [Orchestrator] Exit code 2 : overlay -> antibot -> restart")
     print(f"[{_timestamp()}] [Orchestrator] Press Ctrl+C to stop.")
     print(f"[{_timestamp()}] [Orchestrator] ==========================================\n")
 
@@ -104,13 +110,13 @@ def main() -> None:
                 continue
 
             if exit_code == 0:
-                # Scraper finished cleanly (e.g. no more companies in queue).
+                # Scraper finished cleanly (e.g. no more records in queue).
                 print(f"[{_timestamp()}] [Orchestrator] Scraper finished cleanly. Restarting.")
                 continue
 
             # Any other non-zero code: crash or external kill — restart after a short delay.
             print(f"[{_timestamp()}] [Orchestrator] "
-                  f"Scraper exited with code {exit_code}. Restarting in 10s ...")
+                  f"{SCRAPER_SCRIPT.name} exited with code {exit_code}. Restarting in 10s ...")
             time.sleep(10)
 
     except KeyboardInterrupt:

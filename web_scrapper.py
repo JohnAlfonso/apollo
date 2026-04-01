@@ -44,6 +44,16 @@ BLOCKED_DOMAINS = [
 ]
 
 
+class _OverlayShutdown(BaseException):
+    """Raised when a persistent overlay/Cloudflare block requires process restart (exit 2).
+    Inherits BaseException so broad `except Exception` handlers cannot accidentally swallow it."""
+
+
+# Mutable one-element list so nested functions/closures can set it without 'nonlocal'.
+# When True, all workers stop before their next company and main() exits with code 2.
+_shutdown_requested: list[bool] = [False]
+
+
 def is_interesting_request(url: str, resource_type: str) -> bool:
     url_l = url.lower()
     return (
@@ -618,8 +628,8 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                 # If still present: exit with code 2 so orchestrator.py can
                 # run auto_antibot.py and restart the scraper automatically.
                 if await overlay.count() > 0 and await overlay.first.is_visible():
-                    print("Overlay persists after all dismissal attempts — exiting with code 2 for orchestrator.")
-                    sys.exit(2)
+                    print("Overlay persists after all dismissal attempts — signalling graceful shutdown (exit 2).")
+                    raise _OverlayShutdown()
         except Exception as _ov_err:
             print(f"Overlay dismiss attempt failed (non-fatal): {_ov_err}")
 
@@ -943,6 +953,11 @@ async def _paginate_people_url(page, people_url: str, ctx: dict, label: str) -> 
     await human_idle(page, min_ms=360, max_ms=540)
 
     while True:
+        # Risk 3+4: check shutdown flag at each pagination step so a mid-session
+        # Cloudflare overlay detected by another worker stops us quickly.
+        if _shutdown_requested[0]:
+            print("[Segment] Overlay shutdown — aborting pagination early.")
+            break
         result, reason = await click_next_pagination(page)
         print("click_next_pagination:", result, reason)
         if "not found" in reason.lower() or "disabled" in reason.lower():
@@ -1003,6 +1018,9 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                 print(f"[Segment] total={total} ≤ {PEOPLE_LIMIT} — paginating without filters")
                 await human_idle(page, min_ms=360, max_ms=540)
                 while True:
+                    if _shutdown_requested[0]:  # Risk 3+4: fast exit mid-pagination
+                        print("[Segment] Overlay shutdown — aborting unsegmented pagination.")
+                        break
                     result, reason = await click_next_pagination(page)
                     print("click_next_pagination:", result, reason)
                     if "not found" in reason.lower() or "disabled" in reason.lower():
@@ -1048,6 +1066,9 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                         # ── Level 1 only: paginate this seniority group ──────────
                         await human_idle(page, min_ms=360, max_ms=540)
                         while True:
+                            if _shutdown_requested[0]:  # Risk 3+4: fast exit mid-pagination
+                                print("[Segment] Overlay shutdown — aborting seniority pagination.")
+                                break
                             result, reason = await click_next_pagination(page)
                             print("click_next_pagination:", result, reason)
                             if "not found" in reason.lower() or "disabled" in reason.lower():
@@ -1326,6 +1347,9 @@ async def run_worker(worker_id: int, args) -> None:
 
             batch_num = 0
             while True:
+                if _shutdown_requested[0]:
+                    print(f"[W{worker_id}] Overlay shutdown — stopping before next batch.")
+                    break
                 try:
                     if args.mode == "get_company":
                         rec = await fetch_company_from_queue()
@@ -1347,6 +1371,9 @@ async def run_worker(worker_id: int, args) -> None:
                 print(f"\n[W{worker_id}] Batch {batch_num}: fetched {len(records)} companies")
 
                 for idx, rec in enumerate(records, start=1):
+                    if _shutdown_requested[0]:
+                        print(f"[W{worker_id}] Overlay shutdown — skipping remaining companies in batch.")
+                        break
                     # Proactive Cloudflare check — fires at ~55 min to beat the 60-min wall
                     await proactive_cf_check(page, ctx, threshold_minutes=55)
                     company_id = rec.get("id")
@@ -1600,6 +1627,11 @@ async def run_worker(worker_id: int, args) -> None:
         print(f"[W{worker_id}] Interrupted — reporting done.")
         await report_worker_status(worker_id, ip, "done")
         raise
+    except _OverlayShutdown:
+        _shutdown_requested[0] = True
+        print(f"[W{worker_id}] Overlay/antibot detected — graceful shutdown initiated.")
+        await report_worker_status(worker_id, ip, "done")
+        # Do NOT re-raise: return normally so asyncio.gather does not cancel sibling workers.
     except SystemExit as _se:
         print(f"[W{worker_id}] SystemExit({_se.code}) — reporting error.")
         await report_worker_status(worker_id, ip, "error")
@@ -1615,6 +1647,9 @@ async def main():
     if not Path(STATE_FILE).exists():
         raise FileNotFoundError(f"{STATE_FILE} not found. Run save_apollo_state.py first.")
 
+    # Risk 1: reset module-level flag so re-entrant calls (e.g. tests) start clean.
+    _shutdown_requested[0] = False
+
     try:
         if args.workers <= 1:
             await run_worker(0 + args.worker_index, args)
@@ -1623,6 +1658,13 @@ async def main():
             await asyncio.gather(*(run_worker(i, args) for i in range(args.workers)))
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n[Main] Shutdown requested. All workers reported their final status.")
+    except Exception as _main_exc:
+        # Risk 2: an unhandled worker exception must not skip the exit-2 check below.
+        print(f"[Main] Worker raised unhandled exception: {_main_exc}")
+
+    if _shutdown_requested[0]:
+        print("[Main] Overlay/antibot shutdown — exiting with code 2 for orchestrator.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
