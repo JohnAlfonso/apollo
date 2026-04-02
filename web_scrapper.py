@@ -894,6 +894,22 @@ async def click_next_pagination(page):
 
     print("Clicking Next...")
 
+    # Dismiss Apollo API error modal if it is blocking pointer events.
+    try:
+        error_modal = page.locator("div[role='dialog'][data-ds-legacy-modal='true']")
+        if await error_modal.count() > 0 and await error_modal.first.is_visible():
+            print("API error modal detected — dismissing before click...")
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(400)
+            # Fallback: click the modal's close button if Escape didn't work.
+            if await error_modal.count() > 0 and await error_modal.first.is_visible():
+                close_btn = error_modal.first.locator("button[aria-label='Close'], button[data-icon-name='close'], button.zp_mXUht")
+                if await close_btn.count() > 0:
+                    await close_btn.first.click()
+                    await page.wait_for_timeout(400)
+    except Exception as _modal_err:
+        print(f"Modal dismissal attempt failed (non-fatal): {_modal_err}")
+
     try:
         await human_mouse_move(page)
         await next_button.hover()
