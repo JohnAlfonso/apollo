@@ -635,29 +635,29 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 
         await human_mouse_move(page)
         await search_input.hover()
-        await page.wait_for_timeout(random.randint(60, 135))
+        await page.wait_for_timeout(random.randint(20, 50))
         await search_input.click()
-        await page.wait_for_timeout(random.randint(60, 120))
+        await page.wait_for_timeout(random.randint(20, 45))
 
         await search_input.fill("")
-        await page.wait_for_timeout(random.randint(45, 90))
+        await page.wait_for_timeout(random.randint(15, 35))
 
         await search_input.click()
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Backspace")
-        await page.wait_for_timeout(random.randint(60, 120))
+        await page.wait_for_timeout(random.randint(20, 45))
     except Exception as e:
         return False, f"Could not clear search input: {e}", None
 
     # 3) Type target domain with natural per-character delay
     try:
-        await search_input.type(target_domain, delay=random.randint(24, 45))
-        await page.wait_for_timeout(random.randint(600, 900))
+        await search_input.type(target_domain, delay=random.randint(12, 20))
+        await page.wait_for_timeout(random.randint(200, 350))
     except Exception as e:
         return False, f"Could not type search term: {e}", None
 
     # 4) Wait for dropdown and possible API results
-    await page.wait_for_timeout(750)
+    await page.wait_for_timeout(300)
 
     candidate_rows = []
     retry = 0
@@ -744,7 +744,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
             if retry > 4:
                 return False, "No candidate companies appeared", None
             retry = retry + 1
-            await page.wait_for_timeout(600)
+            await page.wait_for_timeout(200)
         else:
             break
 
@@ -808,7 +808,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     try:
         await human_mouse_move(page)
         await selected["locator"].hover()
-        await page.wait_for_timeout(random.randint(75, 180))
+        await page.wait_for_timeout(random.randint(25, 60))
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
             await selected["locator"].click()
         clicked = True
@@ -816,7 +816,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
         # Apollo is SPA-heavy. Normal navigation often won't fire.
         try:
             await selected["locator"].hover()
-            await page.wait_for_timeout(random.randint(45, 105))
+            await page.wait_for_timeout(random.randint(15, 40))
             await selected["locator"].click()
             clicked = True
         except Exception as e:
@@ -840,7 +840,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     except PlaywrightTimeoutError:
         print("networkidle timeout after company click; continuing")
 
-    await page.wait_for_timeout(900)
+    await page.wait_for_timeout(350)
 
     current_url = page.url
     print("After company click, current URL:", current_url)
@@ -913,7 +913,7 @@ async def click_next_pagination(page):
     try:
         await human_mouse_move(page)
         await next_button.hover()
-        await page.wait_for_timeout(random.randint(90, 210))
+        await page.wait_for_timeout(random.randint(30, 80))
         async with page.expect_response(
             lambda r: "api/v1/mixed_people/search" in r.url.lower(),
             timeout=20000
@@ -940,7 +940,7 @@ async def click_next_pagination(page):
     except PlaywrightTimeoutError:
         print("networkidle timeout after clicking Next; continuing")
 
-    await page.wait_for_timeout(900)
+    await page.wait_for_timeout(350)
     print("After Next click, current URL:", page.url)
 
     return False, "Clicked Next successfully"
@@ -959,14 +959,14 @@ async def _paginate_people_url(page, people_url: str, ctx: dict, label: str) -> 
     await page.goto(people_url, wait_until="domcontentloaded")
 
     try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
+        await page.wait_for_load_state("networkidle", timeout=5000)
     except PlaywrightTimeoutError:
         print("networkidle timeout; continuing")
 
     if "#/login" in page.url:
         return False
 
-    await human_idle(page, min_ms=360, max_ms=540)
+    await human_idle(page, min_ms=120, max_ms=250)
 
     while True:
         # Risk 3+4: check shutdown flag at each pagination step so a mid-session
@@ -978,7 +978,7 @@ async def _paginate_people_url(page, people_url: str, ctx: dict, label: str) -> 
         print("click_next_pagination:", result, reason)
         if "not found" in reason.lower() or "disabled" in reason.lower():
             break
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.2)
 
     try:
         await page.evaluate("() => { window.stop(); }")
@@ -1025,7 +1025,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             if "#/login" in page.url:
                 return False, "Session expired"
 
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(700)
             total = ctx.get("segment_total_entries")
             _limit = ctx.get("people_limit", PEOPLE_LIMIT)
             print(f"[Segment] Unsegmented total_entries={total}")
@@ -1033,7 +1033,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             if total is None or total <= _limit:
                 # ── Within limit: paginate the already-loaded unsegmented page ───
                 print(f"[Segment] total={total} ≤ {_limit} — paginating without filters")
-                await human_idle(page, min_ms=360, max_ms=540)
+                await human_idle(page, min_ms=120, max_ms=250)
                 while True:
                     if _shutdown_requested[0]:  # Risk 3+4: fast exit mid-pagination
                         print("[Segment] Overlay shutdown — aborting unsegmented pagination.")
@@ -1042,7 +1042,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     print("click_next_pagination:", result, reason)
                     if "not found" in reason.lower() or "disabled" in reason.lower():
                         break
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.2)
                 try:
                     await page.evaluate("() => { window.stop(); }")
                 except Exception:
@@ -1064,7 +1064,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     if "#/login" in page.url:
                         return False, "Session expired"
 
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(700)
                     seg_total = ctx.get("segment_total_entries")
                     print(f"[Segment] {seg_label} → total_entries={seg_total}")
 
@@ -1081,7 +1081,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                             await _paginate_people_url(page, title_url, ctx, title_label)
                     else:
                         # ── Level 1 only: paginate this seniority group ──────────
-                        await human_idle(page, min_ms=360, max_ms=540)
+                        await human_idle(page, min_ms=120, max_ms=250)
                         while True:
                             if _shutdown_requested[0]:  # Risk 3+4: fast exit mid-pagination
                                 print("[Segment] Overlay shutdown — aborting seniority pagination.")
@@ -1090,7 +1090,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                             print("click_next_pagination:", result, reason)
                             if "not found" in reason.lower() or "disabled" in reason.lower():
                                 break
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(0.2)
                         try:
                             await page.evaluate("() => { window.stop(); }")
                         except Exception:
@@ -1187,7 +1187,7 @@ async def run_worker(worker_id: int, args) -> None:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=args.headless,
-                slow_mo=100
+                slow_mo=0
             )
 
             context = await browser.new_context(
@@ -1217,7 +1217,6 @@ async def run_worker(worker_id: int, args) -> None:
 
             page = await context.new_page()
             print(f"[DEBUG] Open pages: {len(context.pages)}")
-            await asyncio.sleep(1)
             async def handle_request(request):
                 try:
                     if not is_interesting_request(request.url, request.resource_type):
@@ -1368,7 +1367,7 @@ async def run_worker(worker_id: int, args) -> None:
                 await browser.close()
                 return
 
-            await human_idle(page, min_ms=1200, max_ms=2100)
+            await human_idle(page, min_ms=400, max_ms=800)
 
             batch_num = 0
             while True:
@@ -1454,7 +1453,7 @@ async def run_worker(worker_id: int, args) -> None:
                                     await end_new_person_company(company_id, False)
                                 except Exception as e:
                                     print(f"Failed to mark company_id={company_id}: {e}")
-                                await asyncio.sleep(1)
+                                await asyncio.sleep(0.2)
                                 print("Returning to home page for next target...")
                                 try:
                                     await page.goto("about:blank")
@@ -1462,13 +1461,13 @@ async def run_worker(worker_id: int, args) -> None:
                                     pass
                                 try:
                                     await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
-                                    await page.wait_for_load_state("networkidle", timeout=10000)
+                                    await page.wait_for_load_state("networkidle", timeout=5000)
                                 except PlaywrightTimeoutError:
                                     print("networkidle timeout when returning home; continuing")
                                 except Exception as _e:
                                     print(f"page.goto HOME_URL failed: {_e} — continuing")
                                 await handle_cloudflare(page, ctx)
-                                await human_idle(page, min_ms=600, max_ms=1200)
+                                await human_idle(page, min_ms=200, max_ms=500)
                                 continue
 
                             ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
@@ -1480,7 +1479,7 @@ async def run_worker(worker_id: int, args) -> None:
                                 except Exception as e:
                                     print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(0.2)
                             print("Returning to home page for next target...")
                             try:
                                 await page.goto("about:blank")
@@ -1488,13 +1487,13 @@ async def run_worker(worker_id: int, args) -> None:
                                 pass
                             try:
                                 await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
-                                await page.wait_for_load_state("networkidle", timeout=10000)
+                                await page.wait_for_load_state("networkidle", timeout=5000)
                             except PlaywrightTimeoutError:
                                 print("networkidle timeout when returning home; continuing")
                             except Exception as _e:
                                 print(f"page.goto HOME_URL failed: {_e} — continuing")
                             await handle_cloudflare(page, ctx)
-                            await human_idle(page, min_ms=600, max_ms=1200)
+                            await human_idle(page, min_ms=200, max_ms=500)
                             continue  # skip the search block below
 
                     # Check for Cloudflare before attempting to search
@@ -1612,7 +1611,7 @@ async def run_worker(worker_id: int, args) -> None:
                                         except Exception as e:
                                             print(f"Failed to mark company_id={company_id} as failed: {e}")
 
-                    await asyncio.sleep(random.randint(1, 3))
+                    await asyncio.sleep(random.uniform(0.2, 0.6))
                     # Blank the page first to stop all lingering JS/React before reloading home.
                     print("Returning to home page for next target...")
                     try:
@@ -1627,12 +1626,12 @@ async def run_worker(worker_id: int, args) -> None:
                         print(f"page.goto HOME_URL failed: {_goto_err} — continuing")
                     else:
                         try:
-                            await page.wait_for_load_state("networkidle", timeout=10000)
+                            await page.wait_for_load_state("networkidle", timeout=5000)
                         except PlaywrightTimeoutError:
                             print("networkidle timeout when returning home; continuing")
 
                     await handle_cloudflare(page, ctx)
-                    await human_idle(page, min_ms=600, max_ms=1200)
+                    await human_idle(page, min_ms=200, max_ms=500)
                     print(f"[DEBUG] Open pages: {len(context.pages)}")
 
             if DEBUG_LOG_RESPONSES:
