@@ -633,6 +633,7 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
         except Exception as _ov_err:
             print(f"Overlay dismiss attempt failed (non-fatal): {_ov_err}")
 
+        await human_mouse_move(page)
         await search_input.hover()
         await page.wait_for_timeout(random.randint(20, 50))
         await search_input.click()
@@ -825,18 +826,32 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 async def click_next_pagination(page):
     print("\nTrying to click Next button...")
 
-    # Single combined locator — one round-trip instead of looping 5 selectors
-    next_button = page.locator(
-        "button[aria-label='Next'], button[aria-label='next'], "
-        "a[aria-label='Next'], a[aria-label='next'], "
-        "button:has-text('Next'), a:has-text('Next')"
-    ).first
+    next_selectors = [
+        "button[aria-label='Next']",
+        "button[aria-label='next']",
+        "button:has-text('Next')",
+        "a[aria-label='Next']",
+        "a:has-text('Next')",
+    ]
 
-    try:
-        if not await next_button.is_visible():
-            return False, "Next button not found"
-        print("Matched Next button")
-    except Exception:
+    next_button = None
+    for selector in next_selectors:
+        loc = page.locator(selector)
+        try:
+            count = await loc.count()
+            if count > 0:
+                for i in range(count):
+                    item = loc.nth(i)
+                    if await item.is_visible():
+                        next_button = item
+                        print(f"Matched Next selector: {selector}")
+                        break
+            if next_button:
+                break
+        except Exception as e:
+            print(f"Selector failed: {selector} -> {e}")
+
+    if not next_button:
         return False, "Next button not found"
 
     try:
@@ -868,6 +883,7 @@ async def click_next_pagination(page):
         print(f"Modal dismissal attempt failed (non-fatal): {_modal_err}")
 
     try:
+        await human_mouse_move(page)
         await next_button.hover()
         await page.wait_for_timeout(random.randint(30, 80))
         async with page.expect_response(
@@ -934,7 +950,7 @@ async def _paginate_people_url(page, people_url: str, ctx: dict, label: str) -> 
         print("click_next_pagination:", result, reason)
         if "not found" in reason.lower() or "disabled" in reason.lower():
             break
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
 
     try:
         await page.evaluate("() => { window.stop(); }")
@@ -974,14 +990,14 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             ctx["segment_total_entries"] = None
             await page.goto(people_url, wait_until="domcontentloaded")
             try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
             except PlaywrightTimeoutError:
                 pass
 
             if "#/login" in page.url:
                 return False, "Session expired"
 
-            await page.wait_for_timeout(1200)
+            await page.wait_for_timeout(700)
             total = ctx.get("segment_total_entries")
             _limit = ctx.get("people_limit", PEOPLE_LIMIT)
             print(f"[Segment] Unsegmented total_entries={total}")
@@ -998,7 +1014,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     print("click_next_pagination:", result, reason)
                     if "not found" in reason.lower() or "disabled" in reason.lower():
                         break
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                 try:
                     await page.evaluate("() => { window.stop(); }")
                 except Exception:
@@ -1013,14 +1029,14 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     ctx["segment_total_entries"] = None
                     await page.goto(seg_url, wait_until="domcontentloaded")
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=5000)
+                        await page.wait_for_load_state("networkidle", timeout=10000)
                     except PlaywrightTimeoutError:
                         pass
 
                     if "#/login" in page.url:
                         return False, "Session expired"
 
-                    await page.wait_for_timeout(1200)
+                    await page.wait_for_timeout(700)
                     seg_total = ctx.get("segment_total_entries")
                     print(f"[Segment] {seg_label} → total_entries={seg_total}")
 
@@ -1046,7 +1062,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                             print("click_next_pagination:", result, reason)
                             if "not found" in reason.lower() or "disabled" in reason.lower():
                                 break
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.2)
                         try:
                             await page.evaluate("() => { window.stop(); }")
                         except Exception:
@@ -1143,7 +1159,7 @@ async def run_worker(worker_id: int, args) -> None:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=args.headless,
-                slow_mo=40
+                slow_mo=0
             )
 
             context = await browser.new_context(
