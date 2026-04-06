@@ -715,10 +715,14 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                         if (!score) continue;
 
                         batch.push({ text: rawText, norm_text: normText,
-                                     href: href, selector: sel, score: score });
+                                     href: href, selector: sel, score: score,
+                                     cx: Math.round(rect.left + rect.width / 2),
+                                     cy: Math.round(rect.top + rect.height / 2),
+                                     area: Math.round(rect.width * rect.height) });
                     }
                     if (batch.length > 0) {
-                        batch.sort((a, b) => b.score - a.score);
+                        // Primary: highest score. Tiebreaker: smallest area (most specific element).
+                        batch.sort((a, b) => b.score - a.score || a.area - b.area);
                         return batch.slice(0, 10);
                     }
                 }
@@ -752,25 +756,43 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     clicked = False
 
     href = selected["href"]
+    cx = int(selected.get("cx") or 0)
+    cy = int(selected.get("cy") or 0)
+
     if href and "/organizations/" in href:
         click_loc = page.locator(f'a[href="{href}"]').first
-    else:
-        short_text = selected["text"].strip()[:60]
-        click_loc = page.get_by_text(short_text, exact=False).first
-
-    try:
-        await click_loc.hover()
-        await page.wait_for_timeout(random.randint(25, 60))
-        async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
-            await click_loc.click()
-        clicked = True
-    except Exception:
-        # Apollo is SPA-heavy. Normal navigation often won't fire.
         try:
-            await click_loc.click()
+            await click_loc.hover()
+            await page.wait_for_timeout(random.randint(25, 60))
+            async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
+                await click_loc.click()
             clicked = True
-        except Exception as e:
-            return False, f"Failed to click selected company: {e}", None
+        except Exception:
+            # Apollo is SPA-heavy. Normal navigation often won't fire.
+            try:
+                await click_loc.click()
+                clicked = True
+            except Exception as e:
+                return False, f"Failed to click selected company: {e}", None
+    else:
+        # No org href — Apollo dropdown uses React onClick divs, not <a href> links.
+        # Use coordinate-based click to bypass Playwright's actionability checks.
+        if not cx or not cy:
+            return False, "Failed to click selected company: no href and no coordinates", None
+        print(f"Coordinate click at ({cx}, {cy}) — no org href available")
+        try:
+            await page.mouse.move(cx, cy)
+            await page.wait_for_timeout(random.randint(25, 60))
+            async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
+                await page.mouse.click(cx, cy)
+            clicked = True
+        except Exception:
+            # SPA — navigation event may not fire
+            try:
+                await page.mouse.click(cx, cy)
+                clicked = True
+            except Exception as e:
+                return False, f"Failed to click selected company: {e}", None
 
     if not clicked:
         return False, "Failed to click selected company", None
