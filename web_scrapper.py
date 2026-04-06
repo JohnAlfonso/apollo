@@ -476,8 +476,8 @@ async def handle_cloudflare(page, ctx: dict | None = None) -> bool:
     """
     Full Cloudflare handling flow:
       1. Not blocked          -> return True immediately
-      2. JS challenge         -> wait up to 30s for auto-resolve
-      3. Turnstile/hard block -> poll until user solves manually
+      2. JS challenge         -> wait up to 15s for auto-resolve
+      3. Turnstile/hard block -> raise _OverlayShutdown (exit 2, triggers auto_antibot.py)
       4. Record solve time in ctx so proactive timer can reset
     """
     if not await is_cloudflare_blocked(page):
@@ -491,18 +491,10 @@ async def handle_cloudflare(page, ctx: dict | None = None) -> bool:
             ctx["last_cf_solved_at"] = time.time()
         return True
 
-    # Step 2 – Turnstile / interactive challenge: poll until user clicks checkbox
-    solved = await wait_for_manual_cf_solve(page)
-    if solved:
-        if ctx is not None:
-            ctx["last_cf_solved_at"] = time.time()
-        print("Cloudflare challenge solved manually. Resuming...")
-        await page.wait_for_timeout(600)
-        return True
-
-    # Should never reach here (wait_for_manual_cf_solve loops forever)
-    print("Could not pass Cloudflare challenge. Skipping this target.")
-    return False
+    # Step 2 – Turnstile / hard block: cannot auto-solve.
+    # Trigger immediate restart so orchestrator runs auto_antibot.py.
+    print("Cloudflare Turnstile detected — triggering anti-bot restart (exit 2).")
+    raise _OverlayShutdown()
 
 
 async def proactive_cf_check(page, ctx: dict, threshold_minutes: int = 55) -> None:
