@@ -662,137 +662,165 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     candidate_rows = []
     retry = 0
     while True:
-        # Single JS evaluate replaces hundreds of individual is_visible/inner_text/get_attribute
-        # round-trips — all filtering and scoring happens inside one CDP call.
-        candidate_rows = await page.evaluate("""
-            (args) => {
-                const target_domain = args[0];
-                const target_name   = args[1];
-                const seen = new WeakSet();
+        # Apollo often portals dropdown into body, so search broadly
+        row_selectors = [
+            "a[href*='organizations']",
+            "a",
+            "button",
+            "[role='option']",
+            "[role='link']",
+            "div",
+        ]
 
-                // Priority selector groups — stop at first group that yields results
-                const selectorGroups = [
-                    'a[href*="organizations"]',
-                    'a, [role="option"], [role="link"]',
-                    'button',
-                    'div',
-                ];
+        body = page.locator("body")
 
-                for (const sel of selectorGroups) {
-                    const batch = [];
-                    for (const el of document.querySelectorAll(sel)) {
-                        if (seen.has(el)) continue;
-                        seen.add(el);
+        for row_selector in row_selectors:
+            try:
+                rows = body.locator(row_selector)
+                count = await rows.count()
+                
+                print ("-----------------------------------------------------")
+                print (count, "candidates found with selector:", row_selector)
+                print ("-----------------------------------------------------")
 
-                        // Fast visibility check — avoids getComputedStyle overhead
-                        const rect = el.getBoundingClientRect();
-                        if (!rect.width || !rect.height) continue;
+                temp = []
+                for i in range(count):
+                    row = rows.nth(i)
+                    try:
+                        if not await row.is_visible():
+                            continue
 
-                        const rawText  = (el.innerText  || '').replace(/\\s+/g, ' ').trim();
-                        const normText = rawText.toLowerCase();
-                        if (normText.length < 3 || normText.length > 300) continue;
+                        text = await row.inner_text()
+                        norm_text = normalize_text(text)
+                        if len(norm_text) < 3:
+                            continue
 
-                        const href  = el.getAttribute('href') || '';
-                        const hrefL = href.toLowerCase();
+                        # Reject container elements — individual dropdown rows are short
+                        if len(norm_text) > 300:
+                            continue
 
-                        // Skip generic category nav links
-                        if (hrefL && !hrefL.includes('/organizations/')) {
-                            if (hrefL.includes('#/companies') || hrefL === '/companies') continue;
-                        }
+                        href = (await row.get_attribute("href")) or ""
 
-                        const hasDomain  = normText.includes(target_domain);
-                        const hasName    = target_name.length > 0 && normText.includes(target_name);
-                        const hasOrgLink = hrefL.includes('/organizations/');
+                        # Reject generic category links (e.g. #/companies) - not company org pages
+                        if href and "/organizations/" not in href and "#/organizations/" not in href:
+                            if "#/companies" in href or href.strip() in ("#/companies", "/companies"):
+                                continue
 
-                        if (!hasDomain && !hasName &&
-                            !(hasOrgLink && (normText.includes('companies') || hasDomain))) continue;
+                        # Keep only rows that look like actual company search results
+                        has_domain = target_domain in norm_text
+                        # has_name alone is sufficient: Apollo dropdown shows company name, not domain;
+                        # sidebar nav items ("People", "Companies") won't contain the target company name
+                        has_name = bool(target_name and target_name in norm_text)
+                        has_org_link = "/organizations/" in href or "#/organizations/" in href
 
-                        let score = 0;
-                        if (normText === target_domain)         score += 100;
-                        if (hasDomain)                          score += 50;
-                        if (hasName)                            score += 20;
-                        if (hasOrgLink)                         score += 15;
-                        if (!score) continue;
+                        looks_relevant = (
+                            has_domain
+                            or has_name
+                            or (has_org_link and ("companies" in norm_text or target_domain in norm_text))
+                        )
 
-                        batch.push({ text: rawText, norm_text: normText,
-                                     href: href, selector: sel, score: score,
-                                     cx: Math.round(rect.left + rect.width / 2),
-                                     cy: Math.round(rect.top + rect.height / 2),
-                                     area: Math.round(rect.width * rect.height) });
-                    }
-                    if (batch.length > 0) {
-                        // Primary: highest score. Tiebreaker: smallest area (most specific element).
-                        batch.sort((a, b) => b.score - a.score || a.area - b.area);
-                        return batch.slice(0, 10);
-                    }
-                }
-                return [];
-            }
-        """, [target_domain, target_name or ""])
+                        if not looks_relevant:
+                            continue
 
-        if candidate_rows:
-            print(f"Collected {len(candidate_rows)} candidates via JS evaluate")
+                        temp.append({
+                            "locator": row,
+                            "text": text,
+                            "norm_text": norm_text,
+                            "href": href,
+                            "selector": row_selector,
+                        })
+                    except Exception:
+                        continue
+
+                if temp:
+                    candidate_rows = temp
+                    print(f"Collected {len(candidate_rows)} candidate nodes using selector: {row_selector}")
+                    break
+
+            except Exception as e:
+                print(f"Row selector failed: {row_selector} -> {e}")
+
+        if not candidate_rows:
+            if retry > 4:
+                return False, "No candidate companies appeared", None
+            retry = retry + 1
+            await page.wait_for_timeout(200)
+        else:
             break
-        if retry > 4:
-            return False, "No candidate companies appeared", None
-        retry += 1
-        await page.wait_for_timeout(200)
 
     print("\nCandidate companies:")
     for idx, c in enumerate(candidate_rows[:15], start=1):
-        print(f"[{idx}] selector={c['selector']} score={c['score']}")
+        print(f"[{idx}] selector={c['selector']}")
         print(c["text"][:400])
         print("-" * 100)
 
-    # 5) Top candidate is already scored and sorted by JS
-    selected = candidate_rows[0]
+    # 5) Score candidates - only consider rows that link to an organization page
+    scored_candidates = []
+
+    for c in candidate_rows:
+        href = (c["href"] or "").lower()
+        text = c["norm_text"]
+
+        score = 0
+
+        # Domain match is king
+        if target_domain == text:
+            score += 100
+        if target_domain in text:
+            score += 50
+
+        # Name helps
+        if target_name and target_name in text:
+            score += 20
+
+        # Org link is a strong bonus but NOT a hard requirement
+        # (Apollo dropdown items may use React onClick with no href)
+        if "/organizations/" in href or "#/organizations/" in href:
+            score += 15
+
+        # If the row clearly belongs to company results
+        if "companies" in text:
+            score += 5
+
+        # Must have at least some signal — skip completely unrelated rows
+        if score == 0:
+            continue
+
+        scored_candidates.append((score, c))
+
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    selected = None
+    if scored_candidates and scored_candidates[0][0] > 0:
+        selected = scored_candidates[0][1]
+
+    if not selected:
+        return False, f"No matching company found for domain={target_domain}", None
 
     print("\nSelected company candidate:")
     print(selected["text"][:500])
     print("Selected href:", selected["href"])
 
-    # 6) Build a targeted Playwright locator from href (preferred) or text, then click
+    # 6) Click selected row
     old_url = page.url
     clicked = False
 
-    href = selected["href"]
-    cx = int(selected.get("cx") or 0)
-    cy = int(selected.get("cy") or 0)
-
-    if href and "/organizations/" in href:
-        click_loc = page.locator(f'a[href="{href}"]').first
+    try:
+        await human_mouse_move(page)
+        await selected["locator"].hover()
+        await page.wait_for_timeout(random.randint(25, 60))
+        async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
+            await selected["locator"].click()
+        clicked = True
+    except Exception:
+        # Apollo is SPA-heavy. Normal navigation often won't fire.
         try:
-            await click_loc.hover()
-            await page.wait_for_timeout(random.randint(25, 60))
-            async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
-                await click_loc.click()
+            await selected["locator"].hover()
+            await page.wait_for_timeout(random.randint(15, 40))
+            await selected["locator"].click()
             clicked = True
-        except Exception:
-            # Apollo is SPA-heavy. Normal navigation often won't fire.
-            try:
-                await click_loc.click()
-                clicked = True
-            except Exception as e:
-                return False, f"Failed to click selected company: {e}", None
-    else:
-        # No org href — Apollo dropdown uses React onClick divs, not <a href> links.
-        # Use coordinate-based click to bypass Playwright's actionability checks.
-        if not cx or not cy:
-            return False, "Failed to click selected company: no href and no coordinates", None
-        print(f"Coordinate click at ({cx}, {cy}) — no org href available")
-        try:
-            await page.mouse.move(cx, cy)
-            await page.wait_for_timeout(random.randint(25, 60))
-            async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
-                await page.mouse.click(cx, cy)
-            clicked = True
-        except Exception:
-            # SPA — navigation event may not fire
-            try:
-                await page.mouse.click(cx, cy)
-                clicked = True
-            except Exception as e:
-                return False, f"Failed to click selected company: {e}", None
+        except Exception as e:
+            return False, f"Failed to click selected company: {e}", None
 
     if not clicked:
         return False, "Failed to click selected company", None
