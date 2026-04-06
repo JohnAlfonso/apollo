@@ -711,7 +711,6 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
                         if (hasDomain)                          score += 50;
                         if (hasName)                            score += 20;
                         if (hasOrgLink)                         score += 15;
-                        if (normText.includes('companies'))     score += 5;
                         if (!score) continue;
 
                         batch.push({ text: rawText, norm_text: normText,
