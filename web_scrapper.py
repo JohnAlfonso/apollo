@@ -285,6 +285,22 @@ async def end_new_person_company(company_id: int, success: bool) -> None:
         resp.raise_for_status()
 
 
+async def reset_company_queue_item(company_id: int) -> None:
+    """Reset a get_company-queue record back to unprocessed (flag3=NULL)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/company-queue/{company_id}/reset"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
+
+
+async def reset_new_person_company(company_id: int) -> None:
+    """Reset a new_person-queue record back to unprocessed (flag1=NULL)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/new-person-queue/{company_id}/reset"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
+
+
 async def _get_public_ip() -> str:
     """Fetch the machine's public IP via ipify.org. Returns '0.0.0.0' on failure."""
     try:
@@ -1646,6 +1662,18 @@ async def run_worker(worker_id: int, args) -> None:
     except _OverlayShutdown:
         _shutdown_requested[0] = True
         print(f"[W{worker_id}] Overlay/antibot detected — graceful shutdown initiated.")
+        _reset_cid = ctx.get("current_company_id")
+        _reset_mode = ctx.get("mode")
+        if _reset_cid:
+            try:
+                if _reset_mode == "get_company":
+                    await reset_company_queue_item(_reset_cid)
+                    print(f"[W{worker_id}] Reset get_company flag3=NULL for company_id={_reset_cid}")
+                elif _reset_mode == "new_person":
+                    await reset_new_person_company(_reset_cid)
+                    print(f"[W{worker_id}] Reset new_person flag1=NULL for company_id={_reset_cid}")
+            except Exception as _reset_err:
+                print(f"[W{worker_id}] Failed to reset company status: {_reset_err}")
         await report_worker_status(worker_id, ip, "done")
         # Do NOT re-raise: return normally so asyncio.gather does not cancel sibling workers.
     except SystemExit as _se:
