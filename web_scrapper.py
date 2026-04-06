@@ -253,7 +253,7 @@ async def save_company_info(company_id: int, payload: dict) -> dict | None:
 async def fetch_company_from_queue() -> dict | None:
     """Fetch next company for get_company mode (FOR UPDATE SKIP LOCKED, sets flag3='1')."""
     url = f"{BACKEND_API_URL}/api/data-apollo/company-queue"
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         return resp.json().get("record")
@@ -270,7 +270,7 @@ async def end_company_queue(company_id: int) -> None:
 async def fetch_new_person_company() -> dict | None:
     """Fetch next company for new_person mode (FOR UPDATE SKIP LOCKED, sets flag1=-1)."""
     url = f"{BACKEND_API_URL}/api/data-apollo/new-person-queue"
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         return resp.json().get("record")
@@ -546,7 +546,7 @@ async def fetch_companies(sources: str | None = None) -> list[dict]:
     params = {}
     if sources and sources.strip():
         params["sources"] = sources.strip()
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.get(url, params=params or None)
         resp.raise_for_status()
         data = resp.json()
@@ -557,7 +557,7 @@ async def save_apollo_page(company_id: int, apollo_json: str) -> dict | None:
     """Save Apollo page response to backend (inserts people, sets created_time)."""
     url = f"{BACKEND_API_URL}/api/data-apollo/process"
     payload = {"company_id": company_id, "apollo_json": apollo_json}
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(url, json=payload)
         resp.raise_for_status()
         return resp.json()
