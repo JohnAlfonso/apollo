@@ -633,7 +633,6 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
         except Exception as _ov_err:
             print(f"Overlay dismiss attempt failed (non-fatal): {_ov_err}")
 
-        await human_mouse_move(page)
         await search_input.hover()
         await page.wait_for_timeout(random.randint(20, 50))
         await search_input.click()
@@ -662,162 +661,113 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     candidate_rows = []
     retry = 0
     while True:
-        # Apollo often portals dropdown into body, so search broadly
-        row_selectors = [
-            "a[href*='organizations']",
-            "a",
-            "button",
-            "[role='option']",
-            "[role='link']",
-            "div",
-        ]
+        # Single JS evaluate replaces hundreds of individual is_visible/inner_text/get_attribute
+        # round-trips — all filtering and scoring happens inside one CDP call.
+        candidate_rows = await page.evaluate("""
+            (args) => {
+                const target_domain = args[0];
+                const target_name   = args[1];
+                const seen = new WeakSet();
 
-        body = page.locator("body")
+                // Priority selector groups — stop at first group that yields results
+                const selectorGroups = [
+                    'a[href*="organizations"]',
+                    'a, [role="option"], [role="link"]',
+                    'button',
+                    'div',
+                ];
 
-        for row_selector in row_selectors:
-            try:
-                rows = body.locator(row_selector)
-                count = await rows.count()
-                
-                print ("-----------------------------------------------------")
-                print (count, "candidates found with selector:", row_selector)
-                print ("-----------------------------------------------------")
+                for (const sel of selectorGroups) {
+                    const batch = [];
+                    for (const el of document.querySelectorAll(sel)) {
+                        if (seen.has(el)) continue;
+                        seen.add(el);
 
-                temp = []
-                for i in range(count):
-                    row = rows.nth(i)
-                    try:
-                        if not await row.is_visible():
-                            continue
+                        // Fast visibility check — avoids getComputedStyle overhead
+                        const rect = el.getBoundingClientRect();
+                        if (!rect.width || !rect.height) continue;
 
-                        text = await row.inner_text()
-                        norm_text = normalize_text(text)
-                        if len(norm_text) < 3:
-                            continue
+                        const rawText  = (el.innerText  || '').replace(/\\s+/g, ' ').trim();
+                        const normText = rawText.toLowerCase();
+                        if (normText.length < 3 || normText.length > 300) continue;
 
-                        # Reject container elements — individual dropdown rows are short
-                        if len(norm_text) > 300:
-                            continue
+                        const href  = el.getAttribute('href') || '';
+                        const hrefL = href.toLowerCase();
 
-                        href = (await row.get_attribute("href")) or ""
+                        // Skip generic category nav links
+                        if (hrefL && !hrefL.includes('/organizations/')) {
+                            if (hrefL.includes('#/companies') || hrefL === '/companies') continue;
+                        }
 
-                        # Reject generic category links (e.g. #/companies) - not company org pages
-                        if href and "/organizations/" not in href and "#/organizations/" not in href:
-                            if "#/companies" in href or href.strip() in ("#/companies", "/companies"):
-                                continue
+                        const hasDomain  = normText.includes(target_domain);
+                        const hasName    = target_name.length > 0 && normText.includes(target_name);
+                        const hasOrgLink = hrefL.includes('/organizations/');
 
-                        # Keep only rows that look like actual company search results
-                        has_domain = target_domain in norm_text
-                        # has_name alone is sufficient: Apollo dropdown shows company name, not domain;
-                        # sidebar nav items ("People", "Companies") won't contain the target company name
-                        has_name = bool(target_name and target_name in norm_text)
-                        has_org_link = "/organizations/" in href or "#/organizations/" in href
+                        if (!hasDomain && !hasName &&
+                            !(hasOrgLink && (normText.includes('companies') || hasDomain))) continue;
 
-                        looks_relevant = (
-                            has_domain
-                            or has_name
-                            or (has_org_link and ("companies" in norm_text or target_domain in norm_text))
-                        )
+                        let score = 0;
+                        if (normText === target_domain)         score += 100;
+                        if (hasDomain)                          score += 50;
+                        if (hasName)                            score += 20;
+                        if (hasOrgLink)                         score += 15;
+                        if (normText.includes('companies'))     score += 5;
+                        if (!score) continue;
 
-                        if not looks_relevant:
-                            continue
+                        batch.push({ text: rawText, norm_text: normText,
+                                     href: href, selector: sel, score: score });
+                    }
+                    if (batch.length > 0) {
+                        batch.sort((a, b) => b.score - a.score);
+                        return batch.slice(0, 10);
+                    }
+                }
+                return [];
+            }
+        """, [target_domain, target_name or ""])
 
-                        temp.append({
-                            "locator": row,
-                            "text": text,
-                            "norm_text": norm_text,
-                            "href": href,
-                            "selector": row_selector,
-                        })
-                    except Exception:
-                        continue
-
-                if temp:
-                    candidate_rows = temp
-                    print(f"Collected {len(candidate_rows)} candidate nodes using selector: {row_selector}")
-                    break
-
-            except Exception as e:
-                print(f"Row selector failed: {row_selector} -> {e}")
-
-        if not candidate_rows:
-            if retry > 4:
-                return False, "No candidate companies appeared", None
-            retry = retry + 1
-            await page.wait_for_timeout(200)
-        else:
+        if candidate_rows:
+            print(f"Collected {len(candidate_rows)} candidates via JS evaluate")
             break
+        if retry > 4:
+            return False, "No candidate companies appeared", None
+        retry += 1
+        await page.wait_for_timeout(200)
 
     print("\nCandidate companies:")
     for idx, c in enumerate(candidate_rows[:15], start=1):
-        print(f"[{idx}] selector={c['selector']}")
+        print(f"[{idx}] selector={c['selector']} score={c['score']}")
         print(c["text"][:400])
         print("-" * 100)
 
-    # 5) Score candidates - only consider rows that link to an organization page
-    scored_candidates = []
-
-    for c in candidate_rows:
-        href = (c["href"] or "").lower()
-        text = c["norm_text"]
-
-        score = 0
-
-        # Domain match is king
-        if target_domain == text:
-            score += 100
-        if target_domain in text:
-            score += 50
-
-        # Name helps
-        if target_name and target_name in text:
-            score += 20
-
-        # Org link is a strong bonus but NOT a hard requirement
-        # (Apollo dropdown items may use React onClick with no href)
-        if "/organizations/" in href or "#/organizations/" in href:
-            score += 15
-
-        # If the row clearly belongs to company results
-        if "companies" in text:
-            score += 5
-
-        # Must have at least some signal — skip completely unrelated rows
-        if score == 0:
-            continue
-
-        scored_candidates.append((score, c))
-
-    scored_candidates.sort(key=lambda x: x[0], reverse=True)
-
-    selected = None
-    if scored_candidates and scored_candidates[0][0] > 0:
-        selected = scored_candidates[0][1]
-
-    if not selected:
-        return False, f"No matching company found for domain={target_domain}", None
+    # 5) Top candidate is already scored and sorted by JS
+    selected = candidate_rows[0]
 
     print("\nSelected company candidate:")
     print(selected["text"][:500])
     print("Selected href:", selected["href"])
 
-    # 6) Click selected row
+    # 6) Build a targeted Playwright locator from href (preferred) or text, then click
     old_url = page.url
     clicked = False
 
+    href = selected["href"]
+    if href and "/organizations/" in href:
+        click_loc = page.locator(f'a[href="{href}"]').first
+    else:
+        short_text = selected["text"].strip()[:60]
+        click_loc = page.get_by_text(short_text, exact=False).first
+
     try:
-        await human_mouse_move(page)
-        await selected["locator"].hover()
+        await click_loc.hover()
         await page.wait_for_timeout(random.randint(25, 60))
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
-            await selected["locator"].click()
+            await click_loc.click()
         clicked = True
     except Exception:
         # Apollo is SPA-heavy. Normal navigation often won't fire.
         try:
-            await selected["locator"].hover()
-            await page.wait_for_timeout(random.randint(15, 40))
-            await selected["locator"].click()
+            await click_loc.click()
             clicked = True
         except Exception as e:
             return False, f"Failed to click selected company: {e}", None
@@ -854,32 +804,18 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
 async def click_next_pagination(page):
     print("\nTrying to click Next button...")
 
-    next_selectors = [
-        "button[aria-label='Next']",
-        "button[aria-label='next']",
-        "button:has-text('Next')",
-        "a[aria-label='Next']",
-        "a:has-text('Next')",
-    ]
+    # Single combined locator — one round-trip instead of looping 5 selectors
+    next_button = page.locator(
+        "button[aria-label='Next'], button[aria-label='next'], "
+        "a[aria-label='Next'], a[aria-label='next'], "
+        "button:has-text('Next'), a:has-text('Next')"
+    ).first
 
-    next_button = None
-    for selector in next_selectors:
-        loc = page.locator(selector)
-        try:
-            count = await loc.count()
-            if count > 0:
-                for i in range(count):
-                    item = loc.nth(i)
-                    if await item.is_visible():
-                        next_button = item
-                        print(f"Matched Next selector: {selector}")
-                        break
-            if next_button:
-                break
-        except Exception as e:
-            print(f"Selector failed: {selector} -> {e}")
-
-    if not next_button:
+    try:
+        if not await next_button.is_visible():
+            return False, "Next button not found"
+        print("Matched Next button")
+    except Exception:
         return False, "Next button not found"
 
     try:
@@ -911,7 +847,6 @@ async def click_next_pagination(page):
         print(f"Modal dismissal attempt failed (non-fatal): {_modal_err}")
 
     try:
-        await human_mouse_move(page)
         await next_button.hover()
         await page.wait_for_timeout(random.randint(30, 80))
         async with page.expect_response(
@@ -978,7 +913,7 @@ async def _paginate_people_url(page, people_url: str, ctx: dict, label: str) -> 
         print("click_next_pagination:", result, reason)
         if "not found" in reason.lower() or "disabled" in reason.lower():
             break
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)
 
     try:
         await page.evaluate("() => { window.stop(); }")
@@ -1018,14 +953,14 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
             ctx["segment_total_entries"] = None
             await page.goto(people_url, wait_until="domcontentloaded")
             try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
+                await page.wait_for_load_state("networkidle", timeout=5000)
             except PlaywrightTimeoutError:
                 pass
 
             if "#/login" in page.url:
                 return False, "Session expired"
 
-            await page.wait_for_timeout(700)
+            await page.wait_for_timeout(1200)
             total = ctx.get("segment_total_entries")
             _limit = ctx.get("people_limit", PEOPLE_LIMIT)
             print(f"[Segment] Unsegmented total_entries={total}")
@@ -1042,7 +977,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     print("click_next_pagination:", result, reason)
                     if "not found" in reason.lower() or "disabled" in reason.lower():
                         break
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.5)
                 try:
                     await page.evaluate("() => { window.stop(); }")
                 except Exception:
@@ -1057,14 +992,14 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     ctx["segment_total_entries"] = None
                     await page.goto(seg_url, wait_until="domcontentloaded")
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=10000)
+                        await page.wait_for_load_state("networkidle", timeout=5000)
                     except PlaywrightTimeoutError:
                         pass
 
                     if "#/login" in page.url:
                         return False, "Session expired"
 
-                    await page.wait_for_timeout(700)
+                    await page.wait_for_timeout(1200)
                     seg_total = ctx.get("segment_total_entries")
                     print(f"[Segment] {seg_label} → total_entries={seg_total}")
 
@@ -1090,7 +1025,7 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                             print("click_next_pagination:", result, reason)
                             if "not found" in reason.lower() or "disabled" in reason.lower():
                                 break
-                            await asyncio.sleep(0.2)
+                            await asyncio.sleep(0.5)
                         try:
                             await page.evaluate("() => { window.stop(); }")
                         except Exception:
@@ -1187,7 +1122,7 @@ async def run_worker(worker_id: int, args) -> None:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=args.headless,
-                slow_mo=0
+                slow_mo=40
             )
 
             context = await browser.new_context(
