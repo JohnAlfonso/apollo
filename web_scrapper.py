@@ -1631,7 +1631,7 @@ async def run_worker(worker_id: int, args) -> None:
         raise
     except _OverlayShutdown:
         _shutdown_requested[0] = True
-        print(f"[W{worker_id}] Overlay/antibot detected — graceful shutdown initiated.")
+        print(f"[W{worker_id}] Overlay/antibot detected — resetting company and killing process immediately.")
         _reset_cid = ctx.get("current_company_id")
         _reset_mode = ctx.get("mode")
         if _reset_cid:
@@ -1645,7 +1645,7 @@ async def run_worker(worker_id: int, args) -> None:
             except Exception as _reset_err:
                 print(f"[W{worker_id}] Failed to reset company status: {_reset_err}")
         await report_worker_status(worker_id, ip, "done")
-        # Do NOT re-raise: return normally so asyncio.gather does not cancel sibling workers.
+        sys.exit(2)  # Kill immediately — stops all workers, orchestrator restarts with antibot.
     except SystemExit as _se:
         print(f"[W{worker_id}] SystemExit({_se.code}) — reporting error.")
         await report_worker_status(worker_id, ip, "error")
