@@ -664,96 +664,64 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     except Exception as e:
         return False, f"Could not type search term: {e}", None
 
-    # 4) Wait for dropdown and possible API results
+    # 4) Wait for dropdown and possible API results.
+    #    Single JS evaluate replaces N×3 Playwright IPC calls — one CDP round-trip
+    #    does all filtering inside the browser's V8 engine.
     await page.wait_for_timeout(300)
+
+    _JS_FIND = """([targetDomain, targetName]) => {
+        const groups = [
+            'a[href*="organizations"]',
+            'a, [role="option"], [role="link"]',
+            'button',
+            'div',
+        ];
+        function norm(t) { return (t || '').replace(/\\s+/g, ' ').trim().toLowerCase(); }
+        const seen = new Set();
+        for (const sel of groups) {
+            const found = [];
+            for (const el of document.querySelectorAll(sel)) {
+                const raw = el.textContent || '';
+                const n = norm(raw);
+                if (n.length < 3 || n.length > 300 || seen.has(n)) continue;
+                const href = (el.getAttribute('href') || '').toLowerCase();
+                if (href && !href.includes('/organizations/') &&
+                        (href.includes('#/companies') || href === '/companies')) continue;
+                const hasDomain = n.includes(targetDomain);
+                const hasName = targetName ? n.includes(targetName) : false;
+                const hasOrg = href.includes('/organizations/');
+                if (!hasDomain && !hasName && !(hasOrg && n.includes('companies'))) continue;
+                const r = el.getBoundingClientRect();
+                if (!r.width || !r.height) continue;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden') continue;
+                seen.add(n);
+                found.push({ text: raw.trim().slice(0, 400), norm_text: n, href: href,
+                             selector: sel, cx: Math.round(r.left + r.width / 2),
+                             cy: Math.round(r.top + r.height / 2),
+                             area: Math.round(r.width * r.height) });
+            }
+            if (found.length) return found;
+        }
+        return [];
+    }"""
 
     candidate_rows = []
     retry = 0
     while True:
-        # Apollo often portals dropdown into body, so search broadly
-        row_selectors = [
-            "a[href*='organizations']",
-            "a",
-            "button",
-            "[role='option']",
-            "[role='link']",
-            "div",
-        ]
-
-        body = page.locator("body")
-
-        for row_selector in row_selectors:
-            try:
-                rows = body.locator(row_selector)
-                count = await rows.count()
-                
-                print ("-----------------------------------------------------")
-                print (count, "candidates found with selector:", row_selector)
-                print ("-----------------------------------------------------")
-
-                temp = []
-                for i in range(count):
-                    row = rows.nth(i)
-                    try:
-                        if not await row.is_visible():
-                            continue
-
-                        text = await row.inner_text()
-                        norm_text = normalize_text(text)
-                        if len(norm_text) < 3:
-                            continue
-
-                        # Reject container elements — individual dropdown rows are short
-                        if len(norm_text) > 300:
-                            continue
-
-                        href = (await row.get_attribute("href")) or ""
-
-                        # Reject generic category links (e.g. #/companies) - not company org pages
-                        if href and "/organizations/" not in href and "#/organizations/" not in href:
-                            if "#/companies" in href or href.strip() in ("#/companies", "/companies"):
-                                continue
-
-                        # Keep only rows that look like actual company search results
-                        has_domain = target_domain in norm_text
-                        # has_name alone is sufficient: Apollo dropdown shows company name, not domain;
-                        # sidebar nav items ("People", "Companies") won't contain the target company name
-                        has_name = bool(target_name and target_name in norm_text)
-                        has_org_link = "/organizations/" in href or "#/organizations/" in href
-
-                        looks_relevant = (
-                            has_domain
-                            or has_name
-                            or (has_org_link and ("companies" in norm_text or target_domain in norm_text))
-                        )
-
-                        if not looks_relevant:
-                            continue
-
-                        temp.append({
-                            "locator": row,
-                            "text": text,
-                            "norm_text": norm_text,
-                            "href": href,
-                            "selector": row_selector,
-                        })
-                    except Exception:
-                        continue
-
-                if temp:
-                    candidate_rows = temp
-                    print(f"Collected {len(candidate_rows)} candidate nodes using selector: {row_selector}")
-                    break
-
-            except Exception as e:
-                print(f"Row selector failed: {row_selector} -> {e}")
+        try:
+            candidate_rows = await page.evaluate(_JS_FIND, [target_domain, target_name or ""])
+        except Exception as e:
+            print(f"JS candidate scan failed: {e}")
+            candidate_rows = []
 
         if not candidate_rows:
             if retry > 4:
                 return False, "No candidate companies appeared", None
-            retry = retry + 1
-            await page.wait_for_timeout(200)
+            retry += 1
+            await page.wait_for_timeout(500)
         else:
+            print(f"Found {len(candidate_rows)} candidates (selector={candidate_rows[0]['selector']})")
             break
 
     print("\nCandidate companies:")
@@ -809,23 +777,25 @@ async def search_company_on_searchtag(page, company_domain: str, company_name: s
     print(selected["text"][:500])
     print("Selected href:", selected["href"])
 
-    # 6) Click selected row
+    # 6) Click selected row using stored screen coordinates — no extra IPC needed.
     old_url = page.url
     clicked = False
+    cx, cy = selected["cx"], selected["cy"]
+    href = selected.get("href", "")
 
     try:
-        await human_mouse_move(page)
-        await selected["locator"].hover()
+        await human_mouse_move(page, cx, cy)
         await page.wait_for_timeout(random.randint(25, 60))
-        async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
-            await selected["locator"].click()
+        if href and "/organizations/" in href:
+            async with page.expect_navigation(wait_until="domcontentloaded", timeout=10000):
+                await page.mouse.click(cx, cy)
+        else:
+            await page.mouse.click(cx, cy)
         clicked = True
     except Exception:
-        # Apollo is SPA-heavy. Normal navigation often won't fire.
+        # Fallback: direct coordinate click without navigation wrapper.
         try:
-            await selected["locator"].hover()
-            await page.wait_for_timeout(random.randint(15, 40))
-            await selected["locator"].click()
+            await page.mouse.click(cx, cy)
             clicked = True
         except Exception as e:
             return False, f"Failed to click selected company: {e}", None
