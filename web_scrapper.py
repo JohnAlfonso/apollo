@@ -138,8 +138,6 @@ SENIORITY_SEGMENTS: list[list[str]] = [
     ["head", "director"],
     ["manager"],
     ["senior"],
-    ["entry"],
-    ["intern"],
 ]
 
 # Level-2 segments: job title groups.
@@ -160,7 +158,6 @@ JOB_TITLE_SEGMENTS: list[list[str]] = [
     ["customer success", "support", "service", "consultant"],
     ["legal", "attorney", "counsel", "compliance"],
     ["teacher", "professor", "instructor", "trainer"],
-    ["intern", "associate", "assistant", "student"],
 ]
 
 PEOPLE_LIMIT = 1000  # Apollo Pro plan cap per query
