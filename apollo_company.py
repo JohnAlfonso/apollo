@@ -303,12 +303,12 @@ async def report_worker_status(worker_id: int, ip: str, status: str) -> None:
 # ── Backend API helpers ───────────────────────────────────────────────────────
 
 async def claim_search_url(location: str = "US"):
-    """Claim one fresh, unprocessed search URL record from backend.
+    """Claim one unfinished search URL record from backend.
 
     The backend uses FOR UPDATE SKIP LOCKED + sets created_date atomically,
     so concurrent workers can never claim the same record.
 
-    Returns (record_id, search_url) starting at page 1, or (None, None) when
+    Returns (record_id, search_url) resuming from backend page, or (None, None) when
     no eligible records remain.
     """
     async with httpx.AsyncClient(timeout=30) as client:
@@ -324,9 +324,15 @@ async def claim_search_url(location: str = "US"):
 
     row = records[0]
     record_id = row["id"]
-    # Always start from page 1 — open_people_page_and_run_old_logic handles all
-    # remaining pages via pagination clicks within a single call.
-    search_url = update_page(row["search_url"], 1)
+    # Resume from backend-provided page. Fall back to page 1 when missing/invalid.
+    try:
+        start_page = int(row.get("page") or 1)
+    except Exception:
+        start_page = 1
+    if start_page < 1:
+        start_page = 1
+
+    search_url = update_page(row["search_url"], start_page)
     return record_id, search_url
 
 
