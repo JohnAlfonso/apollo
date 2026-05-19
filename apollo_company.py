@@ -308,8 +308,8 @@ async def claim_search_url(location: str = "US"):
     The backend uses FOR UPDATE SKIP LOCKED + sets created_date atomically,
     so concurrent workers can never claim the same record.
 
-    Returns (record_id, search_url) resuming from backend page, or (None, None) when
-    no eligible records remain.
+    Returns (record_id, search_url, start_page) resuming from backend page,
+    or (None, None, None) when no eligible records remain.
     """
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
@@ -320,7 +320,7 @@ async def claim_search_url(location: str = "US"):
         records = resp.json().get("records", [])
 
     if not records:
-        return None, None
+        return None, None, None
 
     row = records[0]
     record_id = row["id"]
@@ -333,7 +333,7 @@ async def claim_search_url(location: str = "US"):
         start_page = 1
 
     search_url = update_page(row["search_url"], start_page)
-    return record_id, search_url
+    return record_id, search_url, start_page
 
 
 async def end_search_url(record_id: int) -> None:
@@ -483,7 +483,14 @@ async def run_worker(worker_id: int, args) -> None:
                     print(f"[W{worker_id}] Overlay shutdown — stopping before next search URL.")
                     break
 
-                record_id, search_url = await claim_search_url(location=args.location)
+                record_id, search_url, start_page = await claim_search_url(location=args.location)
+
+                if record_id is not None and start_page is not None and start_page > 100:
+                    print(
+                        f"[W{worker_id}] Skipping search_id={record_id}: start page {start_page} > 100."
+                    )
+                    await end_search_url(record_id)
+                    continue
 
                 if not search_url:
                     print(f"[W{worker_id}] " + "=" * 10 + " no records, sleeping " + "=" * 10)
