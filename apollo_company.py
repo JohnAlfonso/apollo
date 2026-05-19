@@ -36,6 +36,8 @@ BLOCKED_DOMAINS = [
     "bat.bing.com",
 ]
 
+MAX_NEXT_CLICK_RETRIES = 3
+
 
 class _OverlayShutdown(BaseException):
     """Raised when a persistent overlay/Cloudflare block requires process restart (exit 2).
@@ -126,43 +128,53 @@ async def click_next_pagination(page):
 
     print("Clicking Next...")
 
-    # Dismiss Apollo API error modal if it is blocking pointer events.
-    try:
-        error_modal = page.locator("div[role='dialog'][data-ds-legacy-modal='true']")
-        if await error_modal.count() > 0 and await error_modal.first.is_visible():
-            print("API error modal detected — dismissing before click...")
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(400)
-            # Fallback: click the modal's close button if Escape didn't work.
+    last_error = None
+    for attempt in range(1, MAX_NEXT_CLICK_RETRIES + 1):
+        # Dismiss Apollo API error modal if it is blocking pointer events.
+        try:
+            error_modal = page.locator("div[role='dialog'][data-ds-legacy-modal='true']")
             if await error_modal.count() > 0 and await error_modal.first.is_visible():
-                close_btn = error_modal.first.locator("button[aria-label='Close'], button[data-icon-name='close'], button.zp_mXUht")
-                if await close_btn.count() > 0:
-                    await close_btn.first.click()
-                    await page.wait_for_timeout(400)
-    except Exception as _modal_err:
-        print(f"Modal dismissal attempt failed (non-fatal): {_modal_err}")
-
-    try:
-        async with page.expect_response(
-            lambda r: "api/v1/mixed_companies/search" in r.url.lower(),
-            timeout=20000
-        ) as resp_info:
-            await next_button.click()
-
-        response = await resp_info.value
-        print("Next-page API response status:", response.status)
-        print("Next-page API response URL   :", response.url)
+                print(f"API error modal detected (attempt {attempt}) — dismissing before click...")
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(400)
+                # Fallback: click the modal's close button if Escape didn't work.
+                if await error_modal.count() > 0 and await error_modal.first.is_visible():
+                    close_btn = error_modal.first.locator("button[aria-label='Close'], button[data-icon-name='close'], button.zp_mXUht")
+                    if await close_btn.count() > 0:
+                        await close_btn.first.click()
+                        await page.wait_for_timeout(400)
+        except Exception as _modal_err:
+            print(f"Modal dismissal attempt failed (non-fatal): {_modal_err}")
 
         try:
-            body = await response.text()
-            print("Next-page API response body snippet:")
-            print(body[:1000])
-        except Exception:
-            print("Could not read next-page response body.")
+            await next_button.scroll_into_view_if_needed()
+            async with page.expect_response(
+                lambda r: "api/v1/mixed_companies/search" in r.url.lower(),
+                timeout=20000
+            ) as resp_info:
+                await next_button.click(timeout=10000)
 
-    except Exception as e:
-        print(f"Error while waiting for pagination response: {e}")
-        return False, f"Pagination click/response error: {e}"
+            response = await resp_info.value
+            print("Next-page API response status:", response.status)
+            print("Next-page API response URL   :", response.url)
+
+            try:
+                body = await response.text()
+                print("Next-page API response body snippet:")
+                print(body[:1000])
+            except Exception:
+                print("Could not read next-page response body.")
+
+            break
+        except Exception as e:
+            last_error = e
+            print(
+                f"Pagination click attempt {attempt}/{MAX_NEXT_CLICK_RETRIES} failed: {e}"
+            )
+            if attempt < MAX_NEXT_CLICK_RETRIES:
+                await page.wait_for_timeout(1200)
+                continue
+            return False, f"Pagination blocked after retries: {e}"
 
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
@@ -215,6 +227,14 @@ async def open_people_page_and_run_old_logic(page, people_url: str):
                 print("[Pagination] Cloudflare detected after Next button disappeared — signalling shutdown.")
                 raise _OverlayShutdown()
             # Genuine end of results.
+            break
+
+        if "blocked after retries" in reason.lower():
+            # Avoid infinite loop on persistent UI clickability issues.
+            if await is_cloudflare_blocked(page):
+                print("[Pagination] Cloudflare detected after repeated click failures — signalling shutdown.")
+                raise _OverlayShutdown()
+            print("[Pagination] Repeated Next-click failures — stopping this URL to avoid infinite retries.")
             break
 
         await asyncio.sleep(random.randint(1, 4))
