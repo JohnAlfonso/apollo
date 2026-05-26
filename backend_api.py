@@ -132,6 +132,22 @@ async def _ensure_apollo_company_columns(conn):
             ALTER TABLE sn71_company
             ADD COLUMN IF NOT EXISTS modified_time TIMESTAMP NULL
         """)
+        await cur.execute("""
+            ALTER TABLE sn71_company
+            ADD COLUMN IF NOT EXISTS real_time_id INTEGER NULL
+        """)
+
+
+async def _ensure_apollo_realtime_columns(conn):
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            ALTER TABLE sn71_company_nonus
+            ADD COLUMN IF NOT EXISTS real_time_id INTEGER NULL
+        """)
+        await cur.execute("""
+            ALTER TABLE sn71_company_apollo_searchurl
+            ADD COLUMN IF NOT EXISTS real_time INTEGER DEFAULT 0
+        """)
 
 
 @app.on_event("startup")
@@ -165,8 +181,10 @@ async def startup_event():
             logger.info("Ensured sn71_session.pay_date column exists")
             # await _ensure_openrouter_keys_table(conn)
             logger.info("Ensured sn71_openrouter_key table exists")
-            # await _ensure_apollo_company_columns(conn)
-            # logger.info("Ensured sn71_company apollo columns (created_time, modified_time)")
+            await _ensure_apollo_company_columns(conn)
+            logger.info("Ensured sn71_company apollo columns (created_time, modified_time, real_time_id)")
+            await _ensure_apollo_realtime_columns(conn)
+            logger.info("Ensured sn71_company_nonus and sn71_company_apollo_searchurl realtime columns")
             # await _ensure_apollo_worker_status_table(conn)
             logger.info("Ensured sn71_apollo_worker_status table exists")
     except Exception as e:
@@ -1729,18 +1747,28 @@ async def save_apollo_search_pagination(search_id: int, pagination_info: Dict[st
     page = pagination_info.get("page")
     total_pages = pagination_info.get("total_pages")
     total_entries = pagination_info.get("total_entries")
+    location = pagination_info.get("location", "US")
 
     if page is None or total_pages is None or total_entries is None:
         raise HTTPException(status_code=400, detail="page, total_pages, total_entries required")
 
     try:
         if page == total_pages or page == 100:
-            sql = """
-                UPDATE sn71_company_apollo_searchurl
-                SET page = %s, total_pages = %s, total_entries = %s,
-                    created_date = CURRENT_DATE, modified_date = CURRENT_DATE
-                WHERE id = %s
-            """
+            if location == "REALTIME":
+                sql = """
+                    UPDATE sn71_company_apollo_searchurl
+                    SET page = %s, total_pages = %s, total_entries = %s,
+                        created_date = CURRENT_DATE, modified_date = CURRENT_DATE,
+                        real_time = 0
+                    WHERE id = %s
+                """
+            else:
+                sql = """
+                    UPDATE sn71_company_apollo_searchurl
+                    SET page = %s, total_pages = %s, total_entries = %s,
+                        created_date = CURRENT_DATE, modified_date = CURRENT_DATE
+                    WHERE id = %s
+                """
         else:
             sql = """
                 UPDATE sn71_company_apollo_searchurl
@@ -1759,17 +1787,29 @@ async def save_apollo_search_pagination(search_id: int, pagination_info: Dict[st
 
 
 @app.post("/api/apollo-search/{search_id}/end-time")
-async def update_apollo_search_end_time(search_id: int):
-    """Set modified_date and clear the in-progress search_condition lock."""
+async def update_apollo_search_end_time(search_id: int, data: Dict[str, Any] = Body(None)):
+    """Set modified_date and clear the in-progress search_condition lock.
+    For REALTIME location, also set real_time = 0.
+    """
+    location = (data.get("location") if data else None) or "US"
     try:
         async with DB_POOL.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("""
-                    UPDATE sn71_company_apollo_searchurl
-                    SET modified_date = NOW(),
-                        search_condition = NULL
-                    WHERE id = %s
-                """, (search_id,))
+                if location == "REALTIME":
+                    await cur.execute("""
+                        UPDATE sn71_company_apollo_searchurl
+                        SET modified_date = NOW(),
+                            search_condition = NULL,
+                            real_time = 0
+                        WHERE id = %s
+                    """, (search_id,))
+                else:
+                    await cur.execute("""
+                        UPDATE sn71_company_apollo_searchurl
+                        SET modified_date = NOW(),
+                            search_condition = NULL
+                        WHERE id = %s
+                    """, (search_id,))
                 await conn.commit()
                 return {"rowcount": cur.rowcount}
     except Exception as e:
@@ -1778,14 +1818,29 @@ async def update_apollo_search_end_time(search_id: int):
 
 
 @app.post("/api/apollo-search/organizations")
-async def save_apollo_organizations(organizations: List[Dict[str, Any]] = Body(...)):
+async def save_apollo_organizations(payload: Dict[str, Any] = Body(...)):
     """
     Save organizations: US companies go to sn71_company, non-US to sn71_company_nonus.
     Orgs missing primary_domain are skipped.
+    Optionally accepts real_time_id to associate with organizations for REALTIME mode.
     """
+    organizations = payload.get("organizations", []) if isinstance(payload, dict) else payload
+    real_time_id = payload.get("real_time_id") if isinstance(payload, dict) else None
+
     inserted_us = 0
     inserted_nonus = 0
 
+    sql_us_with_realtime = """
+        INSERT INTO sn71_company (
+            business, website, source, country,
+            resp_score, wayback_score, sec_edgar_score,
+            whois_dnsbl_score, gdelt_score, companies_house_score,
+            apollo_info, real_time_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (website) DO UPDATE SET apollo_info = EXCLUDED.apollo_info,
+                                          real_time_id = EXCLUDED.real_time_id
+    """
     sql_us = """
         INSERT INTO sn71_company (
             business, website, source, country,
@@ -1795,6 +1850,14 @@ async def save_apollo_organizations(organizations: List[Dict[str, Any]] = Body(.
         )
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (website) DO UPDATE SET apollo_info = EXCLUDED.apollo_info
+    """
+    sql_nonus_with_realtime = """
+        INSERT INTO sn71_company_nonus (
+            business, apollo_id, domain, website, source, country, apollo_info, created_time, real_time_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+        ON CONFLICT (website) DO UPDATE SET apollo_info = EXCLUDED.apollo_info,
+                                          real_time_id = EXCLUDED.real_time_id
     """
     sql_nonus = """
         INSERT INTO sn71_company_nonus (
@@ -1817,25 +1880,48 @@ async def save_apollo_organizations(organizations: List[Dict[str, Any]] = Body(.
                             country = snippet.get("country", "") if snippet else ""
 
                             if country in ("US", "United States"):
-                                await cur.execute(sql_us, (
-                                    org.get("name", ""),
-                                    primary_domain,
-                                    "apollo.io",
-                                    country,
-                                    0, 0, 0, 0, 0, 0,
-                                    Json(org),
-                                ))
+                                if real_time_id is not None:
+                                    await cur.execute(sql_us_with_realtime, (
+                                        org.get("name", ""),
+                                        primary_domain,
+                                        "apollo.io",
+                                        country,
+                                        0, 0, 0, 0, 0, 0,
+                                        Json(org),
+                                        real_time_id,
+                                    ))
+                                else:
+                                    await cur.execute(sql_us, (
+                                        org.get("name", ""),
+                                        primary_domain,
+                                        "apollo.io",
+                                        country,
+                                        0, 0, 0, 0, 0, 0,
+                                        Json(org),
+                                    ))
                                 inserted_us += 1
                             else:
-                                await cur.execute(sql_nonus, (
-                                    org.get("name", ""),
-                                    org.get("id", ""),
-                                    primary_domain,
-                                    org.get("website_url", ""),
-                                    "apollo.io",
-                                    country,
-                                    Json(org),
-                                ))
+                                if real_time_id is not None:
+                                    await cur.execute(sql_nonus_with_realtime, (
+                                        org.get("name", ""),
+                                        org.get("id", ""),
+                                        primary_domain,
+                                        org.get("website_url", ""),
+                                        "apollo.io",
+                                        country,
+                                        Json(org),
+                                        real_time_id,
+                                    ))
+                                else:
+                                    await cur.execute(sql_nonus, (
+                                        org.get("name", ""),
+                                        org.get("id", ""),
+                                        primary_domain,
+                                        org.get("website_url", ""),
+                                        "apollo.io",
+                                        country,
+                                        Json(org),
+                                    ))
                                 inserted_nonus += 1
                 except Exception as e:
                     logger.error(f"Error processing organization {org.get('name', '')}: {e}")

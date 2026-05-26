@@ -336,6 +336,18 @@ async def claim_search_url(location: str = "US"):
     return record_id, search_url, start_page
 
 
+async def end_search_url_with_realtime(record_id: int, location: str = "US") -> None:
+    """Mark search URL as done and set real_time=0 for REALTIME location."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post(
+                f"{BACKEND_API_URL}/api/apollo-search/{record_id}/end-time",
+                json={"location": location},
+            )
+    except Exception as e:
+        print(f"[Backend] Failed to mark search_id={record_id} as done with realtime: {e}")
+
+
 async def end_search_url(record_id: int) -> None:
     """Mark a search URL record as fully processed (sets modified_date)."""
     try:
@@ -453,10 +465,14 @@ async def run_worker(worker_id: int, args) -> None:
                                         item["snippet"] = snippet
                                         break
 
+                            payload = {"organizations": organizations}
+                            if args.location == "REALTIME" and search_id_ref[0] is not None:
+                                payload["real_time_id"] = search_id_ref[0]
+
                             async with httpx.AsyncClient(timeout=60) as client:
                                 await client.post(
                                     f"{BACKEND_API_URL}/api/apollo-search/organizations",
-                                    json=organizations,
+                                    json=payload,
                                 )
 
                             current_search_id = search_id_ref[0]
@@ -465,7 +481,7 @@ async def run_worker(worker_id: int, args) -> None:
                                 async with httpx.AsyncClient(timeout=30) as client:
                                     await client.post(
                                         f"{BACKEND_API_URL}/api/apollo-search/{current_search_id}/pagination",
-                                        json=pagination,
+                                        json={**pagination, "location": args.location},
                                     )
                         except Exception as e:
                             print(f"[W{worker_id}] Error processing response body: {e}")
@@ -489,12 +505,16 @@ async def run_worker(worker_id: int, args) -> None:
                     print(
                         f"[W{worker_id}] Skipping search_id={record_id}: start page {start_page} > 100."
                     )
-                    await end_search_url(record_id)
+                    if args.location == "REALTIME":
+                        await end_search_url_with_realtime(record_id, location=args.location)
+                    else:
+                        await end_search_url(record_id)
                     continue
 
                 if not search_url:
-                    print(f"[W{worker_id}] " + "=" * 10 + " no records, sleeping " + "=" * 10)
-                    await asyncio.sleep(10)
+                    sleep_time = 5 if args.location == "REALTIME" else 10
+                    print(f"[W{worker_id}] " + "=" * 10 + f" no records, sleeping {sleep_time}s " + "=" * 10)
+                    await asyncio.sleep(sleep_time)
                     continue
 
                 search_id_ref[0] = record_id
@@ -509,7 +529,10 @@ async def run_worker(worker_id: int, args) -> None:
                 except _OverlayShutdown:
                     _shutdown_requested[0] = True
                     print(f"[W{worker_id}] Overlay during scrape — graceful shutdown for search_id={record_id}.")
-                    await end_search_url(record_id)
+                    if args.location == "REALTIME":
+                        await end_search_url_with_realtime(record_id, location=args.location)
+                    else:
+                        await end_search_url(record_id)
                     search_id_ref[0] = None
                     break
 
@@ -517,7 +540,10 @@ async def run_worker(worker_id: int, args) -> None:
                 # The backend pagination endpoint already sets modified_date on the
                 # last page; end_search_url is a safe idempotent call for cases where
                 # pagination ended early (e.g. 0-result search URL).
-                await end_search_url(record_id)
+                if args.location == "REALTIME":
+                    await end_search_url_with_realtime(record_id, location=args.location)
+                else:
+                    await end_search_url(record_id)
                 search_id_ref[0] = None
 
                 await page.goto(HOME_URL, wait_until="domcontentloaded")
