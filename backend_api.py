@@ -1822,8 +1822,7 @@ async def update_apollo_search_end_time(search_id: int, data: Dict[str, Any] = B
                     await cur.execute("""
                         UPDATE sn71_company_apollo_searchurl
                         SET modified_date = NOW(),
-                            search_condition = NULL,
-                            real_time = 0
+                            search_condition = NULL
                         WHERE id = %s
                     """, (search_id,))
                 else:
