@@ -150,6 +150,26 @@ async def _ensure_apollo_realtime_columns(conn):
         """)
 
 
+async def _reset_stuck_realtime_at_startup(conn):
+    """Reset any REALTIME records left in 'scrapping' state from previous crashes."""
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                UPDATE sn71_company_apollo_searchurl
+                SET search_condition = NULL
+                WHERE search_condition = 'scrapping'
+                  AND real_time = 1
+            """)
+            reset_count = cur.rowcount
+            if reset_count > 0:
+                await conn.commit()
+                logger.info(f"Reset {reset_count} stuck REALTIME record(s) at startup")
+            return reset_count
+    except Exception as e:
+        logger.error(f"Error resetting stuck REALTIME records at startup: {e}")
+        return 0
+
+
 @app.on_event("startup")
 async def startup_event():
     global DB_POOL, WORKER_STATUS_FLUSH_TASK
@@ -185,6 +205,8 @@ async def startup_event():
             logger.info("Ensured sn71_company apollo columns (created_time, modified_time, real_time_id)")
             await _ensure_apollo_realtime_columns(conn)
             logger.info("Ensured sn71_company_nonus and sn71_company_apollo_searchurl realtime columns")
+            await _reset_stuck_realtime_at_startup(conn)
+            logger.info("Reset any stuck REALTIME records from previous crashes")
             # await _ensure_apollo_worker_status_table(conn)
             logger.info("Ensured sn71_apollo_worker_status table exists")
     except Exception as e:
@@ -1814,6 +1836,54 @@ async def update_apollo_search_end_time(search_id: int, data: Dict[str, Any] = B
                 return {"rowcount": cur.rowcount}
     except Exception as e:
         logger.error(f"Error updating apollo-search end time: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/apollo-search/reset-stuck-realtime")
+async def reset_stuck_realtime_records(timeout_minutes: int = Query(30, ge=1, le=1440, description="Reset records stuck for N minutes")):
+    """Reset REALTIME records stuck in-progress (search_condition='scrapping') back to available.
+
+    Called to recover from crashed/interrupted runs.
+    Only resets records that have been stuck for longer than timeout_minutes.
+    """
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    UPDATE sn71_company_apollo_searchurl
+                    SET search_condition = NULL
+                    WHERE search_condition = 'scrapping'
+                      AND real_time = 1
+                      AND created_date < CURRENT_DATE - INTERVAL '%s minutes'
+                """, (timeout_minutes,))
+                reset_count = cur.rowcount
+                await conn.commit()
+        return {"message": f"Reset {reset_count} stuck REALTIME record(s)", "reset": reset_count}
+    except Exception as e:
+        logger.error(f"Error resetting stuck REALTIME records: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/apollo-search/reset-stuck-realtime-force")
+async def reset_stuck_realtime_records_force():
+    """Force reset ALL stuck REALTIME records immediately (search_condition='scrapping' and real_time=1).
+
+    USE WITH CAUTION - resets all stuck records regardless of how long they've been stuck.
+    """
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    UPDATE sn71_company_apollo_searchurl
+                    SET search_condition = NULL
+                    WHERE search_condition = 'scrapping'
+                      AND real_time = 1
+                """)
+                reset_count = cur.rowcount
+                await conn.commit()
+        return {"message": f"Force reset {reset_count} stuck REALTIME record(s)", "reset": reset_count}
+    except Exception as e:
+        logger.error(f"Error force resetting stuck REALTIME records: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -336,16 +336,29 @@ async def claim_search_url(location: str = "US"):
     return record_id, search_url, start_page
 
 
-async def end_search_url_with_realtime(record_id: int, location: str = "US") -> None:
-    """Mark search URL as done and set real_time=0 for REALTIME location."""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            await client.post(
-                f"{BACKEND_API_URL}/api/apollo-search/{record_id}/end-time",
-                json={"location": location},
-            )
-    except Exception as e:
-        print(f"[Backend] Failed to mark search_id={record_id} as done with realtime: {e}")
+async def end_search_url_with_realtime(record_id: int, location: str = "US", retry_count: int = 3) -> bool:
+    """Mark search URL as done and set real_time=0 for REALTIME location.
+    Retries on failure to ensure search_condition is reset.
+    Returns True on success, False on failure after retries.
+    """
+    for attempt in range(retry_count):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{BACKEND_API_URL}/api/apollo-search/{record_id}/end-time",
+                    json={"location": location},
+                )
+                resp.raise_for_status()
+            print(f"[Backend] Successfully marked search_id={record_id} as done with realtime")
+            return True
+        except Exception as e:
+            print(f"[Backend] Attempt {attempt + 1}/{retry_count} failed to mark search_id={record_id}: {e}")
+            if attempt < retry_count - 1:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                print(f"[Backend] FAILED to reset search_id={record_id} after {retry_count} attempts")
+                return False
+    return False
 
 
 async def end_search_url(record_id: int) -> None:
