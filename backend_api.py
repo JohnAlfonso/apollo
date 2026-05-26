@@ -1775,20 +1775,21 @@ async def save_apollo_search_pagination(search_id: int, pagination_info: Dict[st
         raise HTTPException(status_code=400, detail="page, total_pages, total_entries required")
 
     try:
-        if page == total_pages or page == 100:
+        if page >= 100 or page == total_pages:
             if location == "REALTIME":
                 sql = """
                     UPDATE sn71_company_apollo_searchurl
                     SET page = %s, total_pages = %s, total_entries = %s,
                         created_date = CURRENT_DATE, modified_date = CURRENT_DATE,
-                        real_time = 0
+                        real_time = 0, search_condition = NULL
                     WHERE id = %s
                 """
             else:
                 sql = """
                     UPDATE sn71_company_apollo_searchurl
                     SET page = %s, total_pages = %s, total_entries = %s,
-                        created_date = CURRENT_DATE, modified_date = CURRENT_DATE
+                        created_date = CURRENT_DATE, modified_date = CURRENT_DATE,
+                        search_condition = NULL
                     WHERE id = %s
                 """
         else:
