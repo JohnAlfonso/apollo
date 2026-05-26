@@ -551,7 +551,7 @@ def parse_args():
     parser.add_argument(
         "--location",
         type=str,
-        default=os.environ.get("LOCATION", "US"),
+        default=os.environ.get("LOCATION", "US"), # US, NONUS, REALTIME
         help="Location filter for search URLs (default: US)",
     )
     _headless_str = os.environ.get("HEADLESS", "true")
@@ -602,7 +602,7 @@ async def main():
             worker_tasks = []
             for i in range(args.workers):
                 worker_args = copy.copy(args)
-                worker_args.location = "US" if i < us_count else "NONUS"
+                # worker_args.location = "US" if i < us_count else "NONUS"
                 worker_tasks.append(run_worker(i + args.worker_index, worker_args))
             await asyncio.gather(*worker_tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
