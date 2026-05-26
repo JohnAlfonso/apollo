@@ -361,6 +361,25 @@ async def end_search_url_with_realtime(record_id: int, location: str = "US", ret
     return False
 
 
+async def safe_reset_search_record(record_id: int, location: str, worker_id: int) -> None:
+    """Safely reset a search record when an error occurs.
+
+    Handles both REALTIME and non-REALTIME locations with appropriate error handling.
+    """
+    if record_id is None:
+        return
+    try:
+        if location == "REALTIME":
+            success = await end_search_url_with_realtime(record_id, location=location)
+            if not success:
+                print(f"[W{worker_id}] CRITICAL: Could not reset REALTIME record {record_id} - may need manual intervention")
+        else:
+            await end_search_url(record_id)
+        print(f"[W{worker_id}] Successfully reset search record {record_id}")
+    except Exception as e:
+        print(f"[W{worker_id}] CRITICAL: Failed to reset search record {record_id}: {e}")
+
+
 async def end_search_url(record_id: int) -> None:
     """Mark a search URL record as fully processed (sets modified_date)."""
     try:
@@ -499,9 +518,12 @@ async def run_worker(worker_id: int, args) -> None:
                         except Exception as e:
                             print(f"[W{worker_id}] Error processing response body: {e}")
                             traceback.print_exc()
+                            if args.location == "REALTIME" and search_id_ref[0] is not None:
+                                print(f"[W{worker_id}] REALTIME error detected - may need manual record reset")
 
                 except Exception as e:
                     print(f"[W{worker_id}] handle_response error: {e}")
+                    traceback.print_exc()
 
             page.on("response", handle_response)
 
@@ -518,10 +540,13 @@ async def run_worker(worker_id: int, args) -> None:
                     print(
                         f"[W{worker_id}] Skipping search_id={record_id}: start page {start_page} > 100."
                     )
-                    if args.location == "REALTIME":
-                        await end_search_url_with_realtime(record_id, location=args.location)
-                    else:
-                        await end_search_url(record_id)
+                    try:
+                        if args.location == "REALTIME":
+                            await end_search_url_with_realtime(record_id, location=args.location)
+                        else:
+                            await end_search_url(record_id)
+                    except Exception as e:
+                        print(f"[W{worker_id}] Failed to skip record {record_id}: {e}")
                     continue
 
                 if not search_url:
@@ -548,15 +573,33 @@ async def run_worker(worker_id: int, args) -> None:
                         await end_search_url(record_id)
                     search_id_ref[0] = None
                     break
+                except Exception as e:
+                    print(f"[W{worker_id}] Unexpected error during scrape for search_id={record_id}: {e}")
+                    traceback.print_exc()
+                    print(f"[W{worker_id}] Attempting to reset record due to error...")
+                    try:
+                        if args.location == "REALTIME":
+                            await end_search_url_with_realtime(record_id, location=args.location)
+                        else:
+                            await end_search_url(record_id)
+                    except Exception as reset_err:
+                        print(f"[W{worker_id}] Failed to reset record after error: {reset_err}")
+                    search_id_ref[0] = None
+                    continue
 
                 # Mark record fully processed regardless of pagination outcome.
                 # The backend pagination endpoint already sets modified_date on the
                 # last page; end_search_url is a safe idempotent call for cases where
                 # pagination ended early (e.g. 0-result search URL).
-                if args.location == "REALTIME":
-                    await end_search_url_with_realtime(record_id, location=args.location)
-                else:
-                    await end_search_url(record_id)
+                try:
+                    if args.location == "REALTIME":
+                        success = await end_search_url_with_realtime(record_id, location=args.location)
+                        if not success:
+                            print(f"[W{worker_id}] WARNING: Failed to reset REALTIME record {record_id} after retries")
+                    else:
+                        await end_search_url(record_id)
+                except Exception as e:
+                    print(f"[W{worker_id}] Error ending search for record {record_id}: {e}")
                 search_id_ref[0] = None
 
                 await page.goto(HOME_URL, wait_until="domcontentloaded")
