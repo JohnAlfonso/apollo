@@ -198,16 +198,16 @@ async def startup_event():
     try:
         async with DB_POOL.connection() as conn:
             # await _ensure_session_pay_date_column(conn)
-            logger.info("Ensured sn71_session.pay_date column exists")
-            # await _ensure_openrouter_keys_table(conn)
-            logger.info("Ensured sn71_openrouter_key table exists")
-            await _ensure_apollo_company_columns(conn)
-            logger.info("Ensured sn71_company apollo columns (created_time, modified_time, real_time_id)")
-            await _ensure_apollo_realtime_columns(conn)
-            logger.info("Ensured sn71_company_nonus and sn71_company_apollo_searchurl realtime columns")
-            await _reset_stuck_realtime_at_startup(conn)
-            logger.info("Reset any stuck REALTIME records from previous crashes")
-            # await _ensure_apollo_worker_status_table(conn)
+            # logger.info("Ensured sn71_session.pay_date column exists")
+            # # await _ensure_openrouter_keys_table(conn)
+            # logger.info("Ensured sn71_openrouter_key table exists")
+            # await _ensure_apollo_company_columns(conn)
+            # logger.info("Ensured sn71_company apollo columns (created_time, modified_time, real_time_id)")
+            # await _ensure_apollo_realtime_columns(conn)
+            # logger.info("Ensured sn71_company_nonus and sn71_company_apollo_searchurl realtime columns")
+            # await _reset_stuck_realtime_at_startup(conn)
+            # logger.info("Reset any stuck REALTIME records from previous crashes")
+            # # await _ensure_apollo_worker_status_table(conn)
             logger.info("Ensured sn71_apollo_worker_status table exists")
     except Exception as e:
         logger.error(f"Error running startup database bootstrap tasks: {e}")
@@ -250,7 +250,6 @@ async def get_raw_company_count():
                     FROM sn71_company
                     WHERE
                         m_description IS NULL
-                        AND company_check IS NULL
                         AND contact_info IS NULL
                         AND flag3 IS NULL
                 """)
@@ -270,7 +269,6 @@ async def get_scored_company_count():
                     FROM sn71_company
                     WHERE
                         m_description IS NULL
-                        AND company_check IS NULL
                         AND contact_info IS NULL
                         AND flag3 IS NULL
                         AND resp_score > 18
@@ -291,7 +289,6 @@ async def get_useful_company_count():
                     FROM sn71_company
                     WHERE
                         m_description IS NULL
-                        AND company_check IS NULL
                         AND contact_info IS NOT NULL
                         AND contact_info <> '{}'::jsonb
                         AND country = 'US'
@@ -803,8 +800,7 @@ async def list_data_apollo_sources():
                 await cur.execute("""
                     SELECT DISTINCT COALESCE(source, '(Unknown)') as source
                     FROM sn71_company
-                    WHERE company_check = 1
-                      AND modified_time IS NULL
+                    WHERE modified_time IS NULL
                     ORDER BY source ASC NULLS LAST
                 """)
                 rows = await cur.fetchall()
@@ -1258,7 +1254,6 @@ async def get_new_person_queue():
                         FROM sn71_company
                         WHERE
                             flag1 IS NULL
-                            AND company_check = 1
                         ORDER BY
                             (contact_info ->> 'employeesCount')::int ASC NULLS LAST,
                             resp_score DESC NULLS LAST
@@ -1329,6 +1324,248 @@ async def end_new_person_queue_fail(company_id: int):
         raise
     except Exception as e:
         logger.error(f"Error marking new-person fail for id={company_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── nonus queue endpoints (sn71_company_nonus / sn71_person_nonus) ───────────
+# fetch_flag lifecycle: 1 = queued, 2 = in-progress, 0 = ended (success),
+# -1 = failed, back to 1 on reset (overlay/antibot restart).
+
+@app.get("/api/data-apollo/nonus-queue")
+async def get_nonus_queue():
+    """Fetch next nonus company for nonus_person mode.
+
+    Selects the most recently queued company (fetch_flag=1, ORDER BY fetch_time
+    DESC), locks it with FOR UPDATE SKIP LOCKED so concurrent workers never
+    collide, then immediately marks it in-progress (fetch_flag=2).
+    The apollo_id is the Apollo org id, so the scraper navigates directly
+    without searching.
+    """
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute("""
+                        SELECT id, business AS name, domain, website, apollo_id, country, source
+                        FROM sn71_company_nonus
+                        WHERE fetch_flag = 1
+                          AND apollo_id IS NOT NULL AND apollo_id <> ''
+                        ORDER BY fetch_time DESC NULLS LAST
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    """)
+                    row = await cur.fetchone()
+                    if not row:
+                        return {"record": None}
+
+                    await cur.execute(
+                        "UPDATE sn71_company_nonus SET fetch_flag = 2 WHERE id = %s AND fetch_flag = 1",
+                        (row["id"],),
+                    )
+
+        return {
+            "record": {
+                "id": row["id"],
+                "name": row["name"] or "",
+                "domain": row["domain"] or "",
+                "website": row["website"] or "",
+                "apollo_id": row["apollo_id"] or "",
+                "country": row["country"] or "",
+                "source": row["source"] or "",
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error fetching nonus queue: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/data-apollo/nonus-company-info")
+async def save_nonus_company_info(payload: Dict[str, Any] = Body(...)):
+    """Save scraped Apollo company info for a nonus company.
+
+    Stores the company template payload as JSON in sn71_company_nonus.contact_info.
+    The caller must include ``company_id`` (the database integer id) in the
+    request body alongside the company fields.
+    """
+    company_id = payload.get("company_id")
+    if not company_id:
+        raise HTTPException(status_code=400, detail="company_id is required in payload")
+
+    contact_data = {k: v for k, v in payload.items() if k != "company_id"}
+
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE sn71_company_nonus SET contact_info = %s WHERE id = %s",
+                    (Json(contact_data), company_id),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Company not found")
+                await conn.commit()
+        return {"message": "Nonus company info saved", "company_id": company_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving nonus company info for id={company_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/data-apollo/nonus-process")
+async def process_nonus_apollo_data(payload: Dict[str, Any] = Body(...)):
+    """Process one Apollo people-page JSON for a nonus company and insert into sn71_person_nonus.
+
+    Uses c_website (clean domain) and c_name from the selected sn71_company_nonus
+    record. Deduplicates on (c_website, first_name, last_name).
+    """
+    company_id = payload.get("company_id")
+    apollo_json_str = payload.get("apollo_json", "")
+    if not company_id:
+        raise HTTPException(status_code=400, detail="company_id is required")
+    if not apollo_json_str or not apollo_json_str.strip():
+        raise HTTPException(status_code=400, detail="apollo_json is required")
+
+    try:
+        apollo_data = json.loads(apollo_json_str)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    people = apollo_data.get("people", [])
+    if not people:
+        raise HTTPException(status_code=400, detail="No people found in Apollo JSON")
+
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT domain, website, business AS name FROM sn71_company_nonus WHERE id = %s",
+                    (company_id,)
+                )
+                row = await cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Company not found")
+                c_name = row["name"] or ""
+                c_website = row["domain"] or _extract_domain_from_website(row["website"] or "")
+
+                persons = []
+                for p in people:
+                    person = copy.deepcopy(p)
+                    first_name = person.get("first_name", "")
+                    last_name = person.get("last_name", "")
+                    if not first_name or not last_name:
+                        continue
+                    linkedin_url = person.get("linkedin_url", "")
+                    city = person.get("city", "")
+                    state = person.get("state", "")
+                    country = person.get("country", "")
+                    title = person.get("title", "")
+                    if linkedin_url:
+                        person["liVanity"] = linkedin_url.rstrip("/").split("/")[-1]
+                    else:
+                        person["liVanity"] = ""
+                    person["countryCode"] = country or ""
+                    person["locality"] = ", ".join(x for x in (city, state, country) if x)
+                    person["experience"] = [title] if title else []
+                    persons.append(person)
+
+                sql = """
+                    INSERT INTO sn71_person_nonus (
+                        c_website, c_name, sources_domain, first_name, last_name, contactout_info
+                    )
+                    SELECT %s, %s, %s, %s, %s, %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM sn71_person_nonus
+                        WHERE c_website = %s AND first_name = %s AND last_name = %s
+                    )
+                """
+                params_list = [
+                    (
+                        c_website, c_name, "apollo.io",
+                        p.get("first_name", ""), p.get("last_name", ""), json.dumps(p),
+                        c_website, p.get("first_name", ""), p.get("last_name", ""),
+                    )
+                    for p in persons
+                ]
+                inserted = 0
+                for params in params_list:
+                    await cur.execute(sql, params)
+                    inserted += cur.rowcount
+                skipped = len(persons) - inserted
+
+                await conn.commit()
+
+        return {
+            "message": "Processed successfully",
+            "inserted": inserted,
+            "skipped": skipped,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing nonus Apollo data: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/data-apollo/nonus-queue/{company_id}/success")
+async def end_nonus_queue_success(company_id: int):
+    """Mark nonus company as successfully processed (fetch_flag=0)."""
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE sn71_company_nonus SET fetch_flag = 0 WHERE id = %s",
+                    (company_id,),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Company not found")
+                await conn.commit()
+        return {"message": "Nonus company marked as success", "company_id": company_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error marking nonus success for id={company_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/data-apollo/nonus-queue/{company_id}/fail")
+async def end_nonus_queue_fail(company_id: int):
+    """Mark nonus company as failed (fetch_flag=-1) so it is not retried but stays distinguishable."""
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE sn71_company_nonus SET fetch_flag = -1 WHERE id = %s",
+                    (company_id,),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Company not found")
+                await conn.commit()
+        return {"message": "Nonus company marked as failed", "company_id": company_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error marking nonus fail for id={company_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/data-apollo/nonus-queue/{company_id}/reset")
+async def reset_nonus_queue(company_id: int):
+    """Reset a nonus-queue record back to queued (fetch_flag=1) after an antibot restart."""
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE sn71_company_nonus SET fetch_flag = 1 WHERE id = %s",
+                    (company_id,),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Company not found")
+                await conn.commit()
+        return {"message": "Nonus company reset to queued", "company_id": company_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resetting nonus queue for id={company_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1639,7 +1876,7 @@ async def reset_stuck_contactout_companies():
         async with DB_POOL.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "UPDATE sn71_company SET flag2 = NULL WHERE flag2 = '-1' AND company_check = 1"
+                    "UPDATE sn71_company SET flag2 = NULL WHERE flag2 = '-1'"
                 )
                 reset_count = cur.rowcount
                 await conn.commit()
@@ -1662,7 +1899,7 @@ async def reset_done_contactout_companies(limit: int = Query(10, ge=1, le=1000, 
                     """UPDATE sn71_company SET flag2 = NULL
                        WHERE id IN (
                            SELECT id FROM sn71_company
-                           WHERE flag2 = '1' AND company_check = 1
+                           WHERE flag2 = '1'
                            ORDER BY id ASC
                            LIMIT %s
                        )""",
@@ -1781,7 +2018,7 @@ async def save_apollo_search_pagination(search_id: int, pagination_info: Dict[st
                     UPDATE sn71_company_apollo_searchurl
                     SET page = %s, total_pages = %s, total_entries = %s,
                         created_date = CURRENT_DATE, modified_date = CURRENT_DATE,
-                        real_time = 0, search_condition = NULL
+                        real_time = 0, search_condition = 'end'
                     WHERE id = %s
                 """
             else:
@@ -1789,7 +2026,7 @@ async def save_apollo_search_pagination(search_id: int, pagination_info: Dict[st
                     UPDATE sn71_company_apollo_searchurl
                     SET page = %s, total_pages = %s, total_entries = %s,
                         created_date = CURRENT_DATE, modified_date = CURRENT_DATE,
-                        search_condition = NULL
+                        search_condition = 'end'
                     WHERE id = %s
                 """
         else:
@@ -1818,20 +2055,12 @@ async def update_apollo_search_end_time(search_id: int, data: Dict[str, Any] = B
     try:
         async with DB_POOL.connection() as conn:
             async with conn.cursor() as cur:
-                if location == "REALTIME":
-                    await cur.execute("""
-                        UPDATE sn71_company_apollo_searchurl
-                        SET modified_date = NOW(),
-                            search_condition = NULL
-                        WHERE id = %s
-                    """, (search_id,))
-                else:
-                    await cur.execute("""
-                        UPDATE sn71_company_apollo_searchurl
-                        SET modified_date = NOW(),
-                            search_condition = NULL
-                        WHERE id = %s
-                    """, (search_id,))
+                await cur.execute("""
+                    UPDATE sn71_company_apollo_searchurl
+                    SET modified_date = NOW(),
+                        search_condition = NULL
+                    WHERE id = %s and search_condition = 'scrapping'
+                """, (search_id,))
                 await conn.commit()
                 return {"rowcount": cur.rowcount}
     except Exception as e:
@@ -1888,7 +2117,7 @@ async def reset_stuck_realtime_records_force():
 
 
 @app.post("/api/apollo-search/organizations")
-async def save_apollo_organizations(payload: Dict[str, Any] = Body(...)):
+async def save_apollo_organizations(payload: Any = Body(...)):
     """
     Save organizations: US companies go to sn71_company, non-US to sn71_company_nonus.
     Orgs missing primary_domain are skipped.
@@ -2499,6 +2728,140 @@ async def _rejection_reason_scheduler():
         except Exception as e:
             logger.error(f"Unhandled error in rejection reason scheduler: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(12 * 60 * 60)  # 12 hours
+
+
+# ==================== FF Requests API ====================
+
+def compare_icp(icp1, icp2):
+    """Compare two ICP objects, ignoring excluded_companies field."""
+    if not icp1 or not icp2:
+        return icp1 == icp2
+
+    # Deep copy and remove excluded_companies for comparison
+    icp1_copy = copy.deepcopy(icp1)
+    icp2_copy = copy.deepcopy(icp2)
+
+    icp1_copy.pop('excluded_companies', None)
+    icp2_copy.pop('excluded_companies', None)
+
+    return icp1_copy == icp2_copy
+
+
+@app.get("/api/ff-requests")
+async def get_ff_requests():
+    """Return open ff-requests with matching data from sn71_ff_data."""
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                # 1. Get all open requests
+                await cur.execute("""
+                    SELECT id, request_id, icp, num_leads,
+                           window_end, reveal_window_end,
+                           max_submissions_per_miner
+                    FROM sn71_ff_request
+                    WHERE window_end - NOW() > INTERVAL '-48 hour' AND window_end - NOW() < INTERVAL '1 hour 12 minutes'
+                    ORDER BY window_end DESC
+                """)
+                open_requests = await cur.fetchall()
+
+                # 2. Get distinct request_ids from sn71_ff_data
+                await cur.execute("SELECT DISTINCT request_id FROM sn71_ff_data")
+                ff_data_rows = await cur.fetchall()
+                ff_data_request_ids = {r['request_id'] for r in ff_data_rows}
+
+                # 3. Build response with matching info
+                result = []
+                for r in open_requests:
+                    request_id = r['request_id']
+                    icp = r['icp'] or {}
+
+                    # Check if this request has data in sn71_ff_data
+                    has_ff_data = request_id in ff_data_request_ids
+
+                    # Find other open requests with same ICP that exist in sn71_ff_data
+                    # (excluding excluded_companies). Only build matches for requests
+                    # that themselves have data in sn71_ff_data.
+                    icp_matches = []
+                    for other_r in open_requests:
+                        if other_r['id'] != r['id']:
+                            if other_r['request_id'] in ff_data_request_ids:
+                                if compare_icp(icp, other_r['icp'] or {}):
+                                    icp_matches.append(other_r['request_id'])
+
+                    result.append({
+                        "id": r["id"],
+                        "request_id": request_id,
+                        "icp": icp,
+                        "num_leads": r["num_leads"],
+                        "window_end": r["window_end"].isoformat() if r["window_end"] else None,
+                        "reveal_window_end": r["reveal_window_end"].isoformat() if r["reveal_window_end"] else None,
+                        "max_submissions_per_miner": r["max_submissions_per_miner"],
+                        "has_ff_data": has_ff_data,
+                        "icp_matches": icp_matches,
+                    })
+
+                return {"records": result}
+    except Exception as e:
+        logger.error(f"Error getting ff-requests: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/api/ff-open-requests")
+async def get_ff_open_requests():
+    """Return open ff-requests with matching data from sn71_ff_data."""
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                # 1. Get all open requests
+                await cur.execute("""
+                    SELECT id, request_id, icp, num_leads,
+                           window_end, reveal_window_end,
+                           max_submissions_per_miner
+                    FROM sn71_ff_request
+                    WHERE window_end - NOW() > INTERVAL '0 minutes' AND window_end - NOW() < INTERVAL '1 hour 12 minutes'
+                    ORDER BY window_end DESC
+                """)
+                open_requests = await cur.fetchall()
+
+                # 2. Get distinct request_ids from sn71_ff_data
+                await cur.execute("SELECT DISTINCT request_id FROM sn71_ff_data")
+                ff_data_rows = await cur.fetchall()
+                ff_data_request_ids = {r['request_id'] for r in ff_data_rows}
+
+                # 3. Build response with matching info
+                result = []
+                for r in open_requests:
+                    request_id = r['request_id']
+                    icp = r['icp'] or {}
+
+                    # Check if this request has data in sn71_ff_data
+                    has_ff_data = request_id in ff_data_request_ids
+
+                    # Find other open requests with same ICP that exist in sn71_ff_data
+                    # (excluding excluded_companies). Only build matches for requests
+                    # that themselves have data in sn71_ff_data.
+                    icp_matches = []
+                    for other_r in open_requests:
+                        if other_r['id'] != r['id']:
+                            if other_r['request_id'] in ff_data_request_ids:
+                                if compare_icp(icp, other_r['icp'] or {}):
+                                    icp_matches.append(other_r['request_id'])
+
+                    result.append({
+                        "id": r["id"],
+                        "request_id": request_id,
+                        "icp": icp,
+                        "num_leads": r["num_leads"],
+                        "window_end": r["window_end"].isoformat() if r["window_end"] else None,
+                        "reveal_window_end": r["reveal_window_end"].isoformat() if r["reveal_window_end"] else None,
+                        "max_submissions_per_miner": r["max_submissions_per_miner"],
+                        "has_ff_data": has_ff_data,
+                        "icp_matches": icp_matches,
+                    })
+
+                return {"records": result}
+    except Exception as e:
+        logger.error(f"Error getting ff-open-requests: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

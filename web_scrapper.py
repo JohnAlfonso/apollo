@@ -6,7 +6,7 @@ import random
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import time
 import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -162,20 +162,49 @@ JOB_TITLE_SEGMENTS: list[list[str]] = [
 
 PEOPLE_LIMIT = 1000  # Apollo Pro plan cap per query
 
+# ── ICP segments for nonus_person mode ──────────────────────────────────────
+# Unimportant seniorities (senior, entry, intern) and non-buyer title groups
+# (teachers, customer support, legal, HR/recruiting) are never scraped.
+ICP_SENIORITY_SEGMENTS: list[list[str]] = [
+    ["owner", "founder", "c_suite"],
+    ["partner", "vp"],
+    ["head", "director"],
+    ["manager"],
+]
+
+# Flat list used to pre-filter the base (unsegmented) people URL so people
+# outside the ICP seniorities are never fetched, even for small companies.
+ICP_SENIORITIES_ALL: list[str] = [s for group in ICP_SENIORITY_SEGMENTS for s in group]
+
+ICP_JOB_TITLE_SEGMENTS: list[list[str]] = [
+    ["engineer", "developer", "programmer", "architect"],
+    ["data", "analyst", "scientist", "researcher"],
+    ["sales", "account executive", "account manager", "business development"],
+    ["manager", "supervisor", "lead", "head"],
+    ["director", "vice president", "president", "chief"],
+    ["marketing", "content", "brand", "communications"],
+    ["operations", "coordinator", "specialist", "administrator"],
+    ["finance", "accountant", "auditor", "controller"],
+    ["product manager", "product owner", "designer", "ux"],
+]
+
 
 def build_people_url_segmented(
     org_id: str,
     seniorities: list[str] | None = None,
     titles: list[str] | None = None,
+    locations: tuple[str, ...] | list[str] | None = ("United States",),
 ) -> str:
     """Build an Apollo people URL with optional seniority and job title filters.
     Both personSeniorities[] and personTitles[] are confirmed from real Apollo URLs.
+    locations defaults to United States (US flows); pass None for no location filter.
     """
     url = (
         f"https://app.apollo.io/#/organizations/{org_id}/people"
         f"?page=1&sortByField=recommendations_score&sortAscending=false"
-        f"&personLocations[]=United%20States"
     )
+    for loc in (locations or []):
+        url += f"&personLocations[]={quote(loc)}"
     for s in (seniorities or []):
         url += f"&personSeniorities[]={s}"
     for t in (titles or []):
@@ -298,6 +327,54 @@ async def reset_new_person_company(company_id: int) -> None:
         resp.raise_for_status()
 
 
+# ── nonus_person mode backend helpers (sn71_company_nonus / sn71_person_nonus) ──
+
+async def fetch_nonus_company() -> dict | None:
+    """Fetch next nonus company (fetch_flag=1, FOR UPDATE SKIP LOCKED, sets fetch_flag=2)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/nonus-queue"
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.json().get("record")
+
+
+async def end_nonus_company(company_id: int, success: bool) -> None:
+    """Set fetch_flag=0 (success/ended) or fetch_flag=-1 (fail) for a nonus company."""
+    state = "success" if success else "fail"
+    url = f"{BACKEND_API_URL}/api/data-apollo/nonus-queue/{company_id}/{state}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
+
+
+async def reset_nonus_company(company_id: int) -> None:
+    """Reset a nonus-queue record back to unprocessed (fetch_flag=1)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/nonus-queue/{company_id}/reset"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
+
+
+async def save_nonus_company_info(company_id: int, payload: dict) -> dict | None:
+    """POST company info payload to backend (saved to sn71_company_nonus.contact_info)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/nonus-company-info"
+    body = {"company_id": company_id, **payload}
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(url, json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def save_nonus_apollo_page(company_id: int, apollo_json: str) -> dict | None:
+    """Save Apollo people-page response to backend (inserts into sn71_person_nonus)."""
+    url = f"{BACKEND_API_URL}/api/data-apollo/nonus-process"
+    payload = {"company_id": company_id, "apollo_json": apollo_json}
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def _get_public_ip() -> str:
     """Fetch the machine's public IP via ipify.org. Returns '0.0.0.0' on failure."""
     try:
@@ -322,8 +399,11 @@ async def report_worker_status(worker_id: int, ip: str, status: str) -> None:
         print(f"[W{worker_id}] Failed to report status '{status}': {e}")
 
 
-async def log_company_info(body_text: str, company_id: int | None) -> None:
-    """Parse Apollo org response, map to company template, print and save to backend."""
+async def log_company_info(body_text: str, company_id: int | None, save_func=None) -> None:
+    """Parse Apollo org response, map to company template, print and save to backend.
+    save_func defaults to save_company_info (sn71_company); nonus mode passes
+    save_nonus_company_info (sn71_company_nonus).
+    """
     try:
         data = json.loads(body_text)
     except json.JSONDecodeError:
@@ -343,7 +423,8 @@ async def log_company_info(body_text: str, company_id: int | None) -> None:
     print("=" * 80)
 
     try:
-        result = await save_company_info(company_id, payload)
+        save = save_func or save_company_info
+        result = await save(company_id, payload)
         print(f"[Backend] Saved company info for company_id={company_id}: {result}")
     except Exception as e:
         print(f"[Backend] Failed to save company info for company_id={company_id}: {e}")
@@ -488,11 +569,20 @@ async def wait_for_manual_cf_solve(page, poll_interval_ms: int = 3000) -> bool:
 async def handle_cloudflare(page, ctx: dict | None = None) -> bool:
     """
     Full Cloudflare handling flow:
-      1. Not blocked          -> return True immediately
-      2. JS challenge         -> wait up to 15s for auto-resolve
-      3. Turnstile/hard block -> raise _OverlayShutdown (exit 2, triggers auto_antibot.py)
-      4. Record solve time in ctx so proactive timer can reset
+      1. API-body Turnstile (ctx['cf_api_block']) -> raise _OverlayShutdown immediately
+      2. Not blocked          -> return True immediately
+      3. JS challenge         -> wait up to 15s for auto-resolve
+      4. Turnstile/hard block -> raise _OverlayShutdown (exit 2, triggers auto_antibot.py)
     """
+    # Cloudflare can return a Turnstile challenge inside an Apollo API (XHR)
+    # response body without ever touching the page DOM. handle_response flags
+    # this in ctx['cf_api_block']; such a challenge cannot auto-resolve, so we
+    # go straight to the anti-bot restart (exit 2).
+    if ctx is not None and ctx.get("cf_api_block"):
+        ctx["cf_api_block"] = False
+        print("Cloudflare Turnstile detected in API response — triggering anti-bot restart (exit 2).")
+        raise _OverlayShutdown()
+
     if not await is_cloudflare_blocked(page):
         return True
 
@@ -500,49 +590,12 @@ async def handle_cloudflare(page, ctx: dict | None = None) -> bool:
 
     # Step 1 – try auto-resolve (JS challenge, usually resolves in <10s)
     if await wait_for_cloudflare(page, max_wait_ms=15000):
-        if ctx is not None:
-            ctx["last_cf_solved_at"] = time.time()
         return True
 
     # Step 2 – Turnstile / hard block: cannot auto-solve.
     # Trigger immediate restart so orchestrator runs auto_antibot.py.
     print("Cloudflare Turnstile detected — triggering anti-bot restart (exit 2).")
     raise _OverlayShutdown()
-
-
-async def proactive_cf_check(page, ctx: dict, threshold_minutes: int = 55) -> None:
-    """Proactively trigger a Cloudflare check when approaching the ~1hr reset window.
-
-    Apollo's Cloudflare Turnstile fires roughly every 60 minutes. By checking at
-    55 minutes we catch it before it interrupts active scraping mid-company.
-    """
-    last_solved = ctx.get("last_cf_solved_at")
-    if last_solved is None:
-        return  # No previous solve recorded yet
-
-    elapsed_minutes = (time.time() - last_solved) / 60
-    if elapsed_minutes < threshold_minutes:
-        return  # Still well within the safe window
-
-    print(f"\n[CF Timer] {elapsed_minutes:.1f} min elapsed since last Cloudflare solve "
-          f"(threshold={threshold_minutes} min). Performing proactive check...")
-
-    # Navigate to home to trigger the challenge in a safe, predictable place
-    try:
-        await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
-    except PlaywrightTimeoutError:
-        print("[CF Timer] page.goto timed out during proactive check — skipping.")
-        return
-    except Exception as e:
-        print(f"[CF Timer] page.goto failed during proactive check: {e} — skipping.")
-        return
-    try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
-    except PlaywrightTimeoutError:
-        pass
-
-    await handle_cloudflare(page, ctx)
-    print("[CF Timer] Proactive check complete. Continuing scraping...")
 
 
 async def fetch_companies(sources: str | None = None) -> list[dict]:
@@ -942,6 +995,7 @@ async def _paginate_people_url(page, people_url: str, ctx: dict, label: str) -> 
         return False
 
     await human_idle(page, min_ms=120, max_ms=250)
+    await handle_cloudflare(page, ctx)
 
     while True:
         # Risk 3+4: check shutdown flag at each pagination step so a mid-session
@@ -1001,6 +1055,9 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                 return False, "Session expired"
 
             await page.wait_for_timeout(700)
+            # Detect a Cloudflare Turnstile that fired on the people page (DOM or
+            # API body) — raises _OverlayShutdown (exit 2) so auto_antibot.py runs.
+            await handle_cloudflare(page, ctx)
             total = ctx.get("segment_total_entries")
             _limit = ctx.get("people_limit", PEOPLE_LIMIT)
             print(f"[Segment] Unsegmented total_entries={total}")
@@ -1024,10 +1081,16 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                     pass
             else:
                 # ── Over limit: apply Level 1 seniority segmentation ─────────────
+                # nonus_person mode overrides the segment lists / location via ctx.
+                _seniority_segments = ctx.get("seniority_segments") or SENIORITY_SEGMENTS
+                _title_segments = ctx.get("title_segments") or JOB_TITLE_SEGMENTS
+                _locations = ctx.get("person_locations", ("United States",))
                 print(f"[Segment] total={total} > {_limit} — applying seniority segmentation")
-                for seniority_group in SENIORITY_SEGMENTS:
+                for seniority_group in _seniority_segments:
                     seg_label = f"seniority={seniority_group}"
-                    seg_url = build_people_url_segmented(org_id, seniorities=seniority_group)
+                    seg_url = build_people_url_segmented(
+                        org_id, seniorities=seniority_group, locations=_locations
+                    )
 
                     ctx["segment_total_entries"] = None
                     await page.goto(seg_url, wait_until="domcontentloaded")
@@ -1040,18 +1103,20 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
                         return False, "Session expired"
 
                     await page.wait_for_timeout(700)
+                    await handle_cloudflare(page, ctx)
                     seg_total = ctx.get("segment_total_entries")
                     print(f"[Segment] {seg_label} → total_entries={seg_total}")
 
                     if seg_total is not None and seg_total > _limit:
                         # ── Level 2: split by job title ──────────────────────────
                         print(f"[Segment] {seg_label} exceeds {_limit} — splitting by job title")
-                        for title_group in JOB_TITLE_SEGMENTS:
+                        for title_group in _title_segments:
                             title_label = f"seniority={seniority_group} titles={title_group}"
                             title_url = build_people_url_segmented(
                                 org_id,
                                 seniorities=seniority_group,
                                 titles=title_group,
+                                locations=_locations,
                             )
                             await _paginate_people_url(page, title_url, ctx, title_label)
                     else:
@@ -1075,6 +1140,9 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
         if ctx.get("mode") == "new_person":
             await end_new_person_company(company_id, True)
             print(f"[new_person] Set flag1=1 (success) for company_id={company_id}")
+        elif ctx.get("mode") == "nonus_person":
+            await end_nonus_company(company_id, True)
+            print(f"[nonus_person] Set fetch_flag=0 (success) for company_id={company_id}")
         else:
             await end_company(company_id)
             print(f"Set modified_time for company_id={company_id}")
@@ -1097,11 +1165,13 @@ def parse_args():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["add_person", "get_company", "new_person"],
+        choices=["add_person", "get_company", "new_person", "nonus_person"],
         default=os.environ.get("SCRAPER_MODE", "add_person"),
         help=(
-            "add_person : navigate to each company's people page and scrape contacts (default). "
-            "get_company: capture company profile info only (name, phone, industry, address, etc.)."
+            "add_person  : navigate to each company's people page and scrape contacts (default). "
+            "get_company : capture company profile info only (name, phone, industry, address, etc.). "
+            "nonus_person: process sn71_company_nonus (fetch_flag=1) via apollo_id directly — "
+            "saves company info + ICP-filtered people to the nonus tables."
         ),
     )
     _headless_str = os.environ.get("HEADLESS", "true")
@@ -1152,11 +1222,12 @@ async def run_worker(worker_id: int, args) -> None:
         response_logs = []
         ctx = {
             "current_company_id": None,
-            "last_cf_solved_at": time.time(),  # treat startup as a fresh solve
             "mode": args.mode,
             "company_info_logged": set(),       # tracks company_ids already logged in get_company mode
             "segment_total_entries": None,      # populated by handle_response for the first page of each segment
             "people_limit": args.people_limit,  # configurable via --people_limit
+            "cf_api_block": False,              # set by handle_response when a Turnstile appears in an API body
+            "inflight_company_id": None,        # company being processed; survives the people-page finally for reset
         }
 
         async with async_playwright() as p:
@@ -1255,6 +1326,15 @@ async def run_worker(worker_id: int, args) -> None:
                     except Exception:
                         return
 
+                    # Cloudflare can serve a Turnstile challenge as the API response
+                    # body (XHR) while the page DOM still looks fine. Flag it so the
+                    # navigation loop's handle_cloudflare() raises _OverlayShutdown
+                    # (exit 2) and the orchestrator runs auto_antibot.py.
+                    if body_text and ("cf-turnstile" in body_text or "challenges.cloudflare.com" in body_text):
+                        ctx["cf_api_block"] = True
+                        print(f"[Cloudflare] Turnstile in API body: {response.url}")
+                        return
+
                     if DEBUG_LOG_RESPONSES:
                         response_logs.append({
                             "url": response.url,
@@ -1274,12 +1354,16 @@ async def run_worker(worker_id: int, args) -> None:
 
                     # ── Branch: company info (org detail or mixed_companies) ──────────────
                     if "api/v1/organizations/" in url_l or "api/v1/mixed_companies/search" in url_l:
-                        # Only log in get_company mode, and only once per company.
-                        # Add to the set BEFORE awaiting to prevent async race between
-                        # multiple concurrent response events for the same company.
-                        if ctx.get("mode") == "get_company" and company_id not in ctx["company_info_logged"]:
-                            ctx["company_info_logged"].add(company_id)
-                            await log_company_info(body_text, company_id)
+                        # Only log in get_company / nonus_person modes, and only once per
+                        # company. Add to the set BEFORE awaiting to prevent async race
+                        # between multiple concurrent response events for the same company.
+                        if company_id not in ctx["company_info_logged"]:
+                            if ctx.get("mode") == "get_company":
+                                ctx["company_info_logged"].add(company_id)
+                                await log_company_info(body_text, company_id)
+                            elif ctx.get("mode") == "nonus_person":
+                                ctx["company_info_logged"].add(company_id)
+                                await log_company_info(body_text, company_id, save_func=save_nonus_company_info)
                         return
 
                     # ── Branch: people search pages ───────────────────────────────────────
@@ -1305,7 +1389,10 @@ async def run_worker(worker_id: int, args) -> None:
                         return
 
                     try:
-                        result = await save_apollo_page(company_id, body_text)
+                        if ctx.get("mode") == "nonus_person":
+                            result = await save_nonus_apollo_page(company_id, body_text)
+                        else:
+                            result = await save_apollo_page(company_id, body_text)
                         inserted = result.get("inserted", 0)
                         skipped = result.get("skipped", 0)
                         print(f"[Backend] Saved page for company_id={company_id}: inserted={inserted}, skipped={skipped}")
@@ -1356,6 +1443,9 @@ async def run_worker(worker_id: int, args) -> None:
                     elif args.mode == "new_person":
                         rec = await fetch_new_person_company()
                         records = [rec] if rec else []
+                    elif args.mode == "nonus_person":
+                        rec = await fetch_nonus_company()
+                        records = [rec] if rec else []
                     else:
                         records = await fetch_companies(args.sources or None)
                 except Exception as e:
@@ -1373,9 +1463,14 @@ async def run_worker(worker_id: int, args) -> None:
                     if _shutdown_requested[0]:
                         print(f"[W{worker_id}] Overlay shutdown — skipping remaining companies in batch.")
                         break
-                    # Proactive Cloudflare check — fires at ~55 min to beat the 60-min wall
-                    await proactive_cf_check(page, ctx, threshold_minutes=55)
+                    # Clear any stale API-body Turnstile flag from a previous company
+                    # so it only reflects challenges seen for the current target.
+                    ctx["cf_api_block"] = False
                     company_id = rec.get("id")
+                    # Reset id that survives open_people_page_and_run_old_logic's finally
+                    # (which nulls current_company_id) so the _OverlayShutdown handler can
+                    # still reset this company's queue flag on an anti-bot restart.
+                    ctx["inflight_company_id"] = company_id
                     website = rec.get("website", "")
                     name = rec.get("name", "")
                     company_source = rec.get("source", "")
@@ -1399,6 +1494,64 @@ async def run_worker(worker_id: int, args) -> None:
                     # open_people_page_and_run_old_logic() sets it just-in-time instead.
                     if args.mode == "get_company":
                         ctx["current_company_id"] = company_id
+
+                    # ── nonus_person: apollo_id is the org_id — no Apollo search needed ──────
+                    # ICP filtering: only important seniorities/titles are scraped, and no
+                    # personLocations filter is applied (company is outside the US).
+                    if args.mode == "nonus_person":
+                        apollo_org_id = (rec.get("apollo_id") or "").strip()
+                        if not apollo_org_id:
+                            print(f"[nonus_person] Missing apollo_id for company_id={company_id} — marking failed.")
+                            try:
+                                await end_nonus_company(company_id, False)
+                            except Exception as e:
+                                print(f"Failed to mark company_id={company_id}: {e}")
+                            continue
+
+                        ctx["seniority_segments"] = ICP_SENIORITY_SEGMENTS
+                        ctx["title_segments"] = ICP_JOB_TITLE_SEGMENTS
+                        ctx["person_locations"] = None
+
+                        people_url = build_people_url_segmented(
+                            apollo_org_id,
+                            seniorities=ICP_SENIORITIES_ALL,
+                            locations=None,
+                        )
+                        print(f"[nonus_person] Direct path: org_id={apollo_org_id}, people_url={people_url}")
+
+                        if not await handle_cloudflare(page, ctx):
+                            print(f"Cloudflare blocked people page for company_id={company_id}. Skipping.")
+                            ctx["current_company_id"] = None
+                            try:
+                                await end_nonus_company(company_id, False)
+                            except Exception as e:
+                                print(f"Failed to mark company_id={company_id}: {e}")
+                        else:
+                            ok, msg = await open_people_page_and_run_old_logic(page, people_url, company_id, ctx)
+                            print("open_people_page_and_run_old_logic:", ok, msg)
+                            if not ok:
+                                print(f"People page failed for company_id={company_id}: {msg}")
+                                try:
+                                    await end_nonus_company(company_id, False)
+                                except Exception as e:
+                                    print(f"Failed to mark company_id={company_id} as failed: {e}")
+
+                        await asyncio.sleep(0.2)
+                        print("Returning to home page for next target...")
+                        try:
+                            await page.goto("about:blank")
+                        except Exception:
+                            pass
+                        try:
+                            await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
+                            await page.wait_for_load_state("networkidle", timeout=5000)
+                        except PlaywrightTimeoutError:
+                            print("networkidle timeout when returning home; continuing")
+                        except Exception as _e:
+                            print(f"page.goto HOME_URL failed: {_e} — continuing")
+                        await handle_cloudflare(page, ctx)
+                        await human_idle(page, min_ms=200, max_ms=500)
+                        continue  # skip the search block below
 
                     # ── new_person fast-path: contact_info.source == "apollo" ─────────────────
                     # When the DB already holds Apollo-sourced company info, the org_id is in
@@ -1629,7 +1782,7 @@ async def run_worker(worker_id: int, args) -> None:
     except _OverlayShutdown:
         _shutdown_requested[0] = True
         print(f"[W{worker_id}] Overlay/antibot detected — resetting company and killing process immediately.")
-        _reset_cid = ctx.get("current_company_id")
+        _reset_cid = ctx.get("current_company_id") or ctx.get("inflight_company_id")
         _reset_mode = ctx.get("mode")
         if _reset_cid:
             try:
@@ -1639,6 +1792,9 @@ async def run_worker(worker_id: int, args) -> None:
                 elif _reset_mode == "new_person":
                     await reset_new_person_company(_reset_cid)
                     print(f"[W{worker_id}] Reset new_person flag1=NULL for company_id={_reset_cid}")
+                elif _reset_mode == "nonus_person":
+                    await reset_nonus_company(_reset_cid)
+                    print(f"[W{worker_id}] Reset nonus fetch_flag=1 for company_id={_reset_cid}")
             except Exception as _reset_err:
                 print(f"[W{worker_id}] Failed to reset company status: {_reset_err}")
         await report_worker_status(worker_id, ip, "done")
