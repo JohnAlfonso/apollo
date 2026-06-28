@@ -19,6 +19,8 @@ RESPONSE_LOG_FILE = "apollo_responses.json"
 
 BACKEND_API_URL = os.environ.get("BACKEND_API_URL", "http://95.217.116.91:9900")
 DEBUG_LOG_RESPONSES = os.environ.get("APOLLO_DEBUG_LOG", "").lower() in ("1", "true", "yes")
+# ff_person: how often to poll for new claimable pages while the queue is empty.
+FF_IDLE_POLL_SECONDS = int(os.environ.get("FF_IDLE_POLL_SECONDS", "15"))
 # Set APOLLO_DISCOVER_ENDPOINTS=1 to log ALL Apollo API calls and discover the company info endpoint
 DISCOVER_ENDPOINTS = os.environ.get("APOLLO_DISCOVER_ENDPOINTS", "").lower() in ("1", "true", "yes")
 
@@ -629,6 +631,71 @@ async def end_company(company_id: int) -> None:
         resp.raise_for_status()
 
 
+# ── ff_person mode backend helpers (sn71_ff_request_url / sn71_ff_page_data) ──
+
+async def fetch_ff_page_claim() -> dict | None:
+    """Claim the next Apollo people page to scrape (sn71_ff_request_url cursor).
+
+    The backend reads + claims one page atomically (FOR UPDATE SKIP LOCKED) and
+    returns {url_id, request_id, search_url, page_number}, or None when no open
+    URL has a claimable page.
+    """
+    url = f"{BACKEND_API_URL}/api/ff/page-claim"
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.json().get("record")
+
+
+async def save_ff_page(url_id: int, page_number: int, apollo_json: str) -> dict | None:
+    """Save one scraped people page to backend (inserts into sn71_ff_page_data)."""
+    url = f"{BACKEND_API_URL}/api/ff/page-data"
+    payload = {"url_id": url_id, "page_number": page_number, "apollo_json": apollo_json}
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def end_ff_url(url_id: int) -> None:
+    """Mark an ff URL ended (is_ended=TRUE) so it is not re-claimed (on hard failure)."""
+    url = f"{BACKEND_API_URL}/api/ff/url/{url_id}/end"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url)
+        resp.raise_for_status()
+
+
+async def release_ff_page_claim(url_id: int, page_number: int) -> None:
+    """Release an in-flight page claim so it is reclaimed immediately after restart."""
+    url = f"{BACKEND_API_URL}/api/ff/page-claim/release"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json={"url_id": url_id, "page_number": page_number})
+        resp.raise_for_status()
+
+
+async def ff_has_work() -> bool:
+    """Cheap check (no browser) for whether any FF page is currently claimable."""
+    url = f"{BACKEND_API_URL}/api/ff/has-work"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return bool(resp.json().get("has_work"))
+
+
+def build_people_url_with_page(search_url: str, page_n: int) -> str:
+    """Return search_url with its Apollo `page=` query param set to page_n.
+
+    Apollo people URLs carry the page in the hash query (e.g. `...people?page=1&...`).
+    Replaces an existing page= value, or appends one if absent.
+    """
+    if not search_url:
+        return search_url
+    if re.search(r"([?&])page=\d+", search_url):
+        return re.sub(r"([?&])page=\d+", lambda m: f"{m.group(1)}page={page_n}", search_url, count=1)
+    sep = "&" if "?" in search_url else "?"
+    return f"{search_url}{sep}page={page_n}"
+
+
 async def search_company_on_searchtag(page, company_domain: str, company_name: str | None = None):
     print("\nTrying to search company on search tag...")
 
@@ -1154,6 +1221,130 @@ async def open_people_page_and_run_old_logic(page, people_url: str, company_id: 
         ctx["segment_total_entries"] = None
 
 
+async def run_ff_loop(page, ctx: dict, worker_id: int) -> None:
+    """ff_person mode: drain Apollo people-search pages from the FF queue.
+
+    Repeatedly claims one page (url_id, page_number) from the backend, navigates
+    directly to that page (?page=N), captures the mixed_people/search response,
+    and posts its people to the backend. Many workers cooperatively drain a URL
+    because each claim advances a shared page cursor (FOR UPDATE SKIP LOCKED).
+    """
+    PEOPLE_API = "api/v1/mixed_people/search"
+
+    while not _shutdown_requested[0]:
+        try:
+            claim = await fetch_ff_page_claim()
+        except Exception as e:
+            print(f"[W{worker_id}][ff] claim error: {e}")
+            await asyncio.sleep(5)
+            continue
+
+        if not claim:
+            # Nothing claimable right now — end this browser session. The supervisor
+            # (_ff_supervise) goes back to a cheap, browser-less poll and opens a new
+            # session only when a search_url with work reappears.
+            print(f"[W{worker_id}][ff] no claimable page — ending session.")
+            return
+
+        url_id = claim["url_id"]
+        page_number = claim["page_number"]
+        search_url = claim["search_url"]
+        # Track the in-flight claim so an overlay/antibot shutdown can release it
+        # for immediate reclaim on restart (see run_worker's _OverlayShutdown handler).
+        ctx["ff_inflight"] = {"url_id": url_id, "page_number": page_number}
+        page_url = build_people_url_with_page(search_url, page_number)
+        print("\n" + "#" * 100)
+        print(f"[W{worker_id}][ff] url_id={url_id} page={page_number}")
+        print(f"[W{worker_id}][ff] {page_url}")
+        print("#" * 100)
+
+        # Navigate, then ALWAYS check login + Cloudflare before reading the body.
+        # A hard Cloudflare block suppresses the people API, so expect_response
+        # times out with no response — we must still run handle_cloudflare so it
+        # can trigger the antibot restart (_OverlayShutdown -> exit 2) instead of
+        # silently skipping the page and moving the cursor on.
+        body = None
+        try:
+            response = None
+            try:
+                # Force a FRESH cross-document load so Apollo re-mounts the People
+                # route and reads ?page=N from the URL. A same-document hash change
+                # (page=1 -> page=2) does NOT make the SPA refetch, so the people API
+                # never fires and the capture would time out.
+                try:
+                    await page.goto("about:blank")
+                except Exception:
+                    pass
+                async with page.expect_response(
+                    lambda r: PEOPLE_API in r.url.lower(), timeout=30000
+                ) as resp_info:
+                    await page.goto(page_url, wait_until="domcontentloaded")
+                response = await resp_info.value
+            except PlaywrightTimeoutError:
+                print(f"[W{worker_id}][ff] no people response within timeout (possible CF block).")
+
+            if "#/login" in page.url:
+                print(f"[W{worker_id}][ff] session expired — ending url {url_id}.")
+                await end_ff_url(url_id)
+                continue
+
+            # Settle before the Cloudflare check: the API-body Turnstile flag is set
+            # by the async handle_response task, and a DOM Turnstile renders shortly
+            # after navigation. Without this wait the check races them and misses the
+            # block (the response would then be saved as if it were people data).
+            await page.wait_for_timeout(800)
+
+            # DOM Turnstile or API-body Turnstile (ctx['cf_api_block']) -> _OverlayShutdown.
+            await handle_cloudflare(page, ctx)
+
+            if response is None:
+                # No CF block, but the API still didn't fire — skip without saving.
+                # The page's claim stays outstanding and is reclaimed by another
+                # worker once it goes stale (FF_CLAIM_STALE_SECONDS), so no gap.
+                print(f"[W{worker_id}][ff] skipping page {page_number} for url {url_id} (no response).")
+                await asyncio.sleep(1)
+                continue
+
+            body = await response.text()
+
+            # Defensive: a Turnstile can arrive as the API body itself. Never save it
+            # as people data — trigger the antibot restart (exit 2) instead.
+            if body and ("cf-turnstile" in body or "challenges.cloudflare.com" in body):
+                print(f"[W{worker_id}][ff] Turnstile in captured response body — antibot restart (exit 2).")
+                raise _OverlayShutdown()
+
+            # Verify Apollo actually served the requested page. Its SPA can ignore the
+            # page param and re-serve page 1; saving that would mislabel page-1 data as
+            # page N. If the served page doesn't match, skip (don't corrupt the data).
+            try:
+                served_page = (json.loads(body).get("pagination") or {}).get("page")
+            except Exception:
+                served_page = None
+            if served_page is not None and int(served_page) != int(page_number):
+                print(f"[W{worker_id}][ff] Apollo served page {served_page} for requested "
+                      f"page {page_number} — direct ?page jump NOT honored; skipping.")
+                await asyncio.sleep(1)
+                continue
+        except _OverlayShutdown:
+            raise
+        except Exception as e:
+            # Page not saved -> its claim goes stale -> reclaimed later. No gap.
+            print(f"[W{worker_id}][ff] failed to capture page {page_number} for url {url_id}: {e}")
+            await asyncio.sleep(2)
+            continue
+
+        try:
+            result = await save_ff_page(url_id, page_number, body)
+            print(f"[W{worker_id}][ff] saved url={url_id} page={page_number}: {result}")
+            ctx["ff_inflight"] = None  # saved -> no longer in-flight
+        except Exception as e:
+            print(f"[W{worker_id}][ff] backend save failed for url {url_id} page {page_number}: {e}")
+
+        await asyncio.sleep(random.uniform(0.2, 0.6))
+
+    print(f"[W{worker_id}][ff] loop exited.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Apollo web scraper with backend API integration")
     parser.add_argument(
@@ -1165,13 +1356,15 @@ def parse_args():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["add_person", "get_company", "new_person", "nonus_person"],
+        choices=["add_person", "get_company", "new_person", "nonus_person", "ff_person"],
         default=os.environ.get("SCRAPER_MODE", "add_person"),
         help=(
             "add_person  : navigate to each company's people page and scrape contacts (default). "
             "get_company : capture company profile info only (name, phone, industry, address, etc.). "
             "nonus_person: process sn71_company_nonus (fetch_flag=1) via apollo_id directly — "
-            "saves company info + ICP-filtered people to the nonus tables."
+            "saves company info + ICP-filtered people to the nonus tables. "
+            "ff_person   : drain Apollo people-search URLs from sn71_ff_request_url page by "
+            "page (claim cursor), saving each page to sn71_ff_page_data."
         ),
     )
     _headless_str = os.environ.get("HEADLESS", "true")
@@ -1206,9 +1399,13 @@ def parse_args():
     return parser.parse_args()
 
 
-async def run_worker(worker_id: int, args) -> None:
-    """Single independent scraper worker. Staggered by worker_id * 30s at startup."""
-    if worker_id > 0:
+async def run_worker(worker_id: int, args, stagger: bool = True) -> None:
+    """Single independent scraper worker. Staggered by worker_id * 30s at startup.
+
+    stagger=False skips the startup delay — used by the ff_person supervisor,
+    which opens a fresh session each time work appears and must not re-wait.
+    """
+    if stagger and worker_id > 0:
         delay = worker_id * 30
         print(f"[W{worker_id}] Waiting {delay}s before starting...")
         await asyncio.sleep(delay)
@@ -1228,6 +1425,7 @@ async def run_worker(worker_id: int, args) -> None:
             "people_limit": args.people_limit,  # configurable via --people_limit
             "cf_api_block": False,              # set by handle_response when a Turnstile appears in an API body
             "inflight_company_id": None,        # company being processed; survives the people-page finally for reset
+            "ff_inflight": None,                # ff_person: {url_id, page_number} in flight, released on overlay shutdown
         }
 
         async with async_playwright() as p:
@@ -1435,6 +1633,10 @@ async def run_worker(worker_id: int, args) -> None:
             while True:
                 if _shutdown_requested[0]:
                     print(f"[W{worker_id}] Overlay shutdown — stopping before next batch.")
+                    break
+                # ── ff_person: page-cursor queue, no company search ──────────────────
+                if args.mode == "ff_person":
+                    await run_ff_loop(page, ctx, worker_id)
                     break
                 try:
                     if args.mode == "get_company":
@@ -1768,7 +1970,12 @@ async def run_worker(worker_id: int, args) -> None:
 
             print(f"[W{worker_id}] All done.")
             await report_worker_status(worker_id, ip, "done")
-            await page.pause()
+            # page.pause() opens the Playwright Inspector and blocks forever — only
+            # useful for interactive debugging. In ff_person the queue genuinely
+            # drains, so pausing would hang the process and the orchestrator. Exit
+            # cleanly instead (close the browser and let the worker return).
+            if args.mode != "ff_person":
+                await page.pause()
             try:
                 await context.unroute_all(behavior="ignoreErrors")
             except Exception:
@@ -1797,6 +2004,17 @@ async def run_worker(worker_id: int, args) -> None:
                     print(f"[W{worker_id}] Reset nonus fetch_flag=1 for company_id={_reset_cid}")
             except Exception as _reset_err:
                 print(f"[W{worker_id}] Failed to reset company status: {_reset_err}")
+        # ff_person has no company id — release the in-flight page claim instead so
+        # the restarted worker re-claims it immediately (no wait for the stale window).
+        if _reset_mode == "ff_person":
+            _ff_inflight = ctx.get("ff_inflight")
+            if _ff_inflight:
+                try:
+                    await release_ff_page_claim(_ff_inflight["url_id"], _ff_inflight["page_number"])
+                    print(f"[W{worker_id}] Released ff claim url={_ff_inflight['url_id']} "
+                          f"page={_ff_inflight['page_number']} for immediate reclaim")
+                except Exception as _rel_err:
+                    print(f"[W{worker_id}] Failed to release ff claim: {_rel_err}")
         await report_worker_status(worker_id, ip, "done")
         sys.exit(2)  # Kill immediately — stops all workers, orchestrator restarts with antibot.
     except SystemExit as _se:
@@ -1809,6 +2027,43 @@ async def run_worker(worker_id: int, args) -> None:
         raise
 
 
+async def _ff_supervise(worker_id: int, args) -> None:
+    """ff_person supervisor: keep NO browser open while the queue is empty.
+
+    Cheaply polls /api/ff/has-work (no browser). When a search_url with claimable
+    pages appears, opens a scraping session (run_worker) that drains the queue and
+    then closes the browser; loops back to polling. So workers run only while
+    there is work, and start again immediately when a new URL is seeded.
+    """
+    if worker_id > 0:
+        delay = worker_id * 30
+        print(f"[W{worker_id}] Waiting {delay}s before starting...")
+        await asyncio.sleep(delay)
+
+    print(f"[W{worker_id}][ff] supervisor started — polling for work every {FF_IDLE_POLL_SECONDS}s.")
+    announced_idle = False
+    while not _shutdown_requested[0]:
+        try:
+            has = await ff_has_work()
+        except Exception as e:
+            print(f"[W{worker_id}][ff] has-work check failed: {e}")
+            await asyncio.sleep(FF_IDLE_POLL_SECONDS)
+            continue
+
+        if not has:
+            if not announced_idle:
+                print(f"[W{worker_id}][ff] no URLs to scrape — waiting (browser closed).")
+                announced_idle = True
+            await asyncio.sleep(FF_IDLE_POLL_SECONDS)
+            continue
+
+        announced_idle = False
+        print(f"[W{worker_id}][ff] work available — opening scraping session.")
+        # run_worker opens the browser, drains via run_ff_loop, then closes it and
+        # returns. On overlay it sys.exit(2)s (orchestrator restarts). No re-stagger.
+        await run_worker(worker_id, args, stagger=False)
+
+
 async def main():
     args = parse_args()
     if not Path(STATE_FILE).exists():
@@ -1817,12 +2072,15 @@ async def main():
     # Risk 1: reset module-level flag so re-entrant calls (e.g. tests) start clean.
     _shutdown_requested[0] = False
 
+    # ff_person runs under a supervisor that only opens a browser when work exists.
+    _runner = _ff_supervise if args.mode == "ff_person" else run_worker
+
     try:
         if args.workers <= 1:
-            await run_worker(0 + args.worker_index, args)
+            await _runner(0 + args.worker_index, args)
         else:
             print(f"Starting {args.workers} workers with 30s stagger...")
-            await asyncio.gather(*(run_worker(i, args) for i in range(args.workers)))
+            await asyncio.gather(*(_runner(i, args) for i in range(args.workers)))
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n[Main] Shutdown requested. All workers reported their final status.")
     except Exception as _main_exc:

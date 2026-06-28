@@ -13,6 +13,7 @@ import logging
 import os
 import json
 import copy
+import math
 import asyncio
 import traceback
 import httpx
@@ -170,6 +171,67 @@ async def _reset_stuck_realtime_at_startup(conn):
         return 0
 
 
+async def _ensure_ff_tables(conn):
+    """Create the FF per-URL queue table and the per-page data table if missing.
+
+    sn71_ff_request_url holds one row per search URL belonging to an
+    sn71_ff_request (a request may have several URLs). current_page is the
+    page cursor advanced atomically by /api/ff/page-claim; total_page is
+    learned from the first page's pagination; is_ended marks a drained URL.
+
+    sn71_ff_page_data holds one row per scraped page (its people array as JSONB).
+
+    sn71_ff_page_claim holds only OUTSTANDING (in-flight) page claims: a row is
+    inserted when a page is handed out and deleted when its data is saved, so a
+    claim row whose claimed_at is stale marks a crashed/blocked page to reclaim.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            CREATE TABLE IF NOT EXISTS sn71_ff_request_url (
+                id            SERIAL       PRIMARY KEY,
+                request_id    TEXT         NOT NULL,
+                search_url    TEXT         NOT NULL,
+                current_page  INTEGER      NOT NULL DEFAULT 0,
+                total_page    INTEGER      NULL,
+                is_ended      BOOLEAN      NOT NULL DEFAULT FALSE,
+                claimed_at    TIMESTAMP    NULL,
+                created_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+                updated_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+                UNIQUE (request_id, search_url)
+            )
+        """)
+        await cur.execute("""
+            CREATE TABLE IF NOT EXISTS sn71_ff_page_data (
+                id            SERIAL       PRIMARY KEY,
+                url_id        INTEGER      NOT NULL REFERENCES sn71_ff_request_url(id),
+                request_id    TEXT         NULL,
+                page_number   INTEGER      NOT NULL,
+                people        JSONB        NOT NULL,
+                person_count  INTEGER      NULL,
+                created_at    TIMESTAMP    NOT NULL DEFAULT NOW(),
+                UNIQUE (url_id, page_number)
+            )
+        """)
+        await cur.execute("""
+            CREATE TABLE IF NOT EXISTS sn71_ff_page_claim (
+                url_id       INTEGER   NOT NULL REFERENCES sn71_ff_request_url(id),
+                page_number  INTEGER   NOT NULL,
+                claimed_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (url_id, page_number)
+            )
+        """)
+        # Index for fast page-claim scans (open URLs ordered by cursor).
+        await cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ff_request_url_open
+            ON sn71_ff_request_url (is_ended, current_page)
+        """)
+        # Index for fast stale-claim (gap) reclaim scans.
+        await cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ff_page_claim_stale
+            ON sn71_ff_page_claim (claimed_at)
+        """)
+
+
 @app.on_event("startup")
 async def startup_event():
     global DB_POOL, WORKER_STATUS_FLUSH_TASK
@@ -209,6 +271,8 @@ async def startup_event():
             # logger.info("Reset any stuck REALTIME records from previous crashes")
             # # await _ensure_apollo_worker_status_table(conn)
             logger.info("Ensured sn71_apollo_worker_status table exists")
+            await _ensure_ff_tables(conn)
+            logger.info("Ensured sn71_ff_request_url and sn71_ff_page_data tables exist")
     except Exception as e:
         logger.error(f"Error running startup database bootstrap tasks: {e}")
         raise
@@ -2769,6 +2833,28 @@ async def get_ff_requests():
                 ff_data_rows = await cur.fetchall()
                 ff_data_request_ids = {r['request_id'] for r in ff_data_rows}
 
+                # 2b. Get the search URLs attached to each request. A request may
+                # have many URLs in the sn71_ff_request_url scraping queue, so we
+                # collect them all into a per-request list (with scrape progress).
+                url_map = {}
+                req_ids = [r['request_id'] for r in open_requests]
+                if req_ids:
+                    await cur.execute("""
+                        SELECT request_id, id AS url_id, search_url,
+                               current_page, total_page, is_ended
+                        FROM sn71_ff_request_url
+                        WHERE request_id = ANY(%s)
+                        ORDER BY request_id, id ASC
+                    """, (req_ids,))
+                    for u in await cur.fetchall():
+                        url_map.setdefault(u['request_id'], []).append({
+                            "url_id": u["url_id"],
+                            "search_url": u["search_url"],
+                            "current_page": u["current_page"],
+                            "total_page": u["total_page"],
+                            "is_ended": u["is_ended"],
+                        })
+
                 # 3. Build response with matching info
                 result = []
                 for r in open_requests:
@@ -2796,6 +2882,7 @@ async def get_ff_requests():
                         "window_end": r["window_end"].isoformat() if r["window_end"] else None,
                         "reveal_window_end": r["reveal_window_end"].isoformat() if r["reveal_window_end"] else None,
                         "max_submissions_per_miner": r["max_submissions_per_miner"],
+                        "urls": url_map.get(request_id, []),
                         "has_ff_data": has_ff_data,
                         "icp_matches": icp_matches,
                     })
@@ -2804,7 +2891,166 @@ async def get_ff_requests():
     except Exception as e:
         logger.error(f"Error getting ff-requests: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+
+@app.post("/api/ff-requests/{record_id}/urls")
+async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)):
+    """Attach a new search URL to an ff-request.
+
+    Inserts a row into sn71_ff_request_url (the worker page-scraping queue) for
+    the request's request_id. ``record_id`` is the sn71_ff_request.id shown in
+    the dashboard. A request may hold many URLs; a duplicate (same URL already
+    present for the request) is returned as-is rather than re-inserted.
+
+    Body: {"search_url": "https://app.apollo.io/#/people?..."}
+    """
+    raw = payload.get("search_url")
+    search_url = raw.strip() if isinstance(raw, str) else None
+    if not search_url:
+        raise HTTPException(status_code=400, detail="search_url is required")
+
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                # Resolve the request_id from the dashboard's integer id.
+                await cur.execute(
+                    "SELECT request_id FROM sn71_ff_request WHERE id = %s",
+                    (record_id,),
+                )
+                req = await cur.fetchone()
+                if not req:
+                    raise HTTPException(status_code=404, detail="FF request not found")
+                request_id = req["request_id"]
+
+                await cur.execute(
+                    """
+                    INSERT INTO sn71_ff_request_url (request_id, search_url)
+                    VALUES (%s, %s)
+                    ON CONFLICT (request_id, search_url) DO NOTHING
+                    RETURNING id
+                    """,
+                    (request_id, search_url),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    # URL already attached to this request — return the existing row.
+                    await cur.execute(
+                        "SELECT id FROM sn71_ff_request_url WHERE request_id = %s AND search_url = %s",
+                        (request_id, search_url),
+                    )
+                    row = await cur.fetchone()
+                    await conn.commit()
+                    return {"message": "URL already attached", "id": record_id,
+                            "request_id": request_id, "url_id": row["id"],
+                            "search_url": search_url, "duplicate": True}
+                await conn.commit()
+                return {"message": "URL added", "id": record_id,
+                        "request_id": request_id, "url_id": row["id"],
+                        "search_url": search_url, "duplicate": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding url for ff-request id={record_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/ff-requests/url/{url_id}")
+async def edit_ff_request_url(url_id: int, payload: Dict[str, Any] = Body(...)):
+    """Change the search URL of a single sn71_ff_request_url row (by url id).
+
+    Scrape progress (cursor, claims, saved pages) is preserved. Rejected with
+    409 if the new URL already exists for the same request.
+
+    Body: {"search_url": "https://app.apollo.io/#/people?..."}
+    """
+    raw = payload.get("search_url")
+    search_url = raw.strip() if isinstance(raw, str) else None
+    if not search_url:
+        raise HTTPException(status_code=400, detail="search_url is required")
+
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT request_id FROM sn71_ff_request_url WHERE id = %s",
+                    (url_id,),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="URL not found")
+                request_id = row["request_id"]
+
+                # Guard the UNIQUE (request_id, search_url) constraint.
+                await cur.execute(
+                    "SELECT 1 FROM sn71_ff_request_url "
+                    "WHERE request_id = %s AND search_url = %s AND id <> %s LIMIT 1",
+                    (request_id, search_url, url_id),
+                )
+                if await cur.fetchone():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This URL is already attached to the request",
+                    )
+
+                await cur.execute(
+                    "UPDATE sn71_ff_request_url SET search_url = %s, updated_at = NOW() WHERE id = %s",
+                    (search_url, url_id),
+                )
+                await conn.commit()
+                return {"message": "URL updated", "url_id": url_id,
+                        "request_id": request_id, "search_url": search_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error editing url id={url_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/ff-requests/url/{url_id}")
+async def delete_ff_request_url(url_id: int):
+    """Detach a search URL from a request (delete its sn71_ff_request_url row).
+
+    Rejected with 409 if any pages have already been scraped or claimed for the
+    URL, since those rows reference it (sn71_ff_page_data / sn71_ff_page_claim).
+    """
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT request_id FROM sn71_ff_request_url WHERE id = %s",
+                    (url_id,),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="URL not found")
+
+                await cur.execute(
+                    "SELECT 1 FROM sn71_ff_page_data WHERE url_id = %s LIMIT 1", (url_id,)
+                )
+                has_data = await cur.fetchone()
+                await cur.execute(
+                    "SELECT 1 FROM sn71_ff_page_claim WHERE url_id = %s LIMIT 1", (url_id,)
+                )
+                has_claim = await cur.fetchone()
+                if has_data or has_claim:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Cannot delete: pages already scraped or claimed for this URL",
+                    )
+
+                await cur.execute(
+                    "DELETE FROM sn71_ff_request_url WHERE id = %s", (url_id,)
+                )
+                await conn.commit()
+                return {"message": "URL deleted", "url_id": url_id,
+                        "request_id": row["request_id"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting url id={url_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/ff-open-requests")
 async def get_ff_open_requests():
     """Return open ff-requests with matching data from sn71_ff_data."""
@@ -2861,6 +3107,380 @@ async def get_ff_open_requests():
                 return {"records": result}
     except Exception as e:
         logger.error(f"Error getting ff-open-requests: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== FF URL page-scraping API ====================
+# Workers scrape Apollo people-search URLs page by page. Each URL is a row in
+# sn71_ff_request_url; many workers cooperatively drain a URL by claiming one
+# page at a time (page cursor). Each scraped page lands in sn71_ff_page_data.
+# Outstanding claims live in sn71_ff_page_claim; a claim older than
+# FF_CLAIM_STALE_SECONDS with no saved page is reclaimed (crash/overlay recovery).
+
+FF_CLAIM_STALE_SECONDS = int(os.getenv("FF_CLAIM_STALE_SECONDS", "300"))
+
+
+@app.post("/api/ff/urls")
+async def seed_ff_urls(payload: Dict[str, Any] = Body(...)):
+    """Insert search URLs for an ff-request (one row per URL in sn71_ff_request_url).
+
+    Body: {"request_id": "...", "urls": ["https://app.apollo.io/#/...", ...]}
+    Existing (request_id, search_url) pairs are skipped (ON CONFLICT DO NOTHING).
+    """
+    request_id = payload.get("request_id")
+    urls = payload.get("urls") or []
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    if not isinstance(urls, list) or not urls:
+        raise HTTPException(status_code=400, detail="urls must be a non-empty list")
+
+    request_id = str(request_id)
+    clean_urls = [u.strip() for u in urls if isinstance(u, str) and u.strip()]
+    if not clean_urls:
+        raise HTTPException(status_code=400, detail="no valid urls provided")
+
+    try:
+        inserted = 0
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                for u in clean_urls:
+                    await cur.execute(
+                        """
+                        INSERT INTO sn71_ff_request_url (request_id, search_url)
+                        VALUES (%s, %s)
+                        ON CONFLICT (request_id, search_url) DO NOTHING
+                        """,
+                        (request_id, u),
+                    )
+                    inserted += cur.rowcount
+                await conn.commit()
+        return {"message": "URLs seeded", "request_id": request_id,
+                "inserted": inserted, "skipped": len(clean_urls) - inserted}
+    except Exception as e:
+        logger.error(f"Error seeding ff urls for request_id={request_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _ff_claim_record(row) -> dict:
+    return {
+        "url_id": row["url_id"],
+        "request_id": row["request_id"],
+        "search_url": row["search_url"],
+        "page_number": row["page_number"],
+    }
+
+
+@app.get("/api/ff/page-claim")
+async def claim_ff_page():
+    """Atomically claim the next page to scrape, with crash/overlay recovery.
+
+    Two-step claim inside one transaction:
+      1. Reclaim a STALE GAP — an outstanding claim (in sn71_ff_page_claim) older
+         than FF_CLAIM_STALE_SECONDS whose page was never saved. This recovers
+         pages a worker claimed but lost to a crash or Cloudflare/overlay restart.
+      2. Otherwise advance the FRONTIER — pick the next open URL (is_ended=FALSE)
+         whose cursor can advance, lock it FOR UPDATE SKIP LOCKED, bump
+         current_page, and record the new claim. Page 1 is handed out first so a
+         single worker learns total_page before later pages open up.
+
+    The claim row is deleted when the page's data is saved, so only in-flight
+    pages ever sit in sn71_ff_page_claim.
+    """
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    # ── 1) Stale-gap reclaim ──────────────────────────────────────
+                    await cur.execute(
+                        """
+                        SELECT c.url_id, c.page_number, u.request_id, u.search_url
+                        FROM sn71_ff_page_claim c
+                        JOIN sn71_ff_request_url u ON u.id = c.url_id
+                        WHERE u.is_ended = FALSE
+                          AND c.claimed_at < NOW() - make_interval(secs => %s)
+                          AND (u.total_page IS NULL OR c.page_number <= u.total_page)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM sn71_ff_page_data d
+                              WHERE d.url_id = c.url_id AND d.page_number = c.page_number
+                          )
+                        ORDER BY c.claimed_at ASC
+                        LIMIT 1
+                        FOR UPDATE OF c SKIP LOCKED
+                        """,
+                        (FF_CLAIM_STALE_SECONDS,),
+                    )
+                    gap = await cur.fetchone()
+                    if gap:
+                        await cur.execute(
+                            "UPDATE sn71_ff_page_claim SET claimed_at = NOW() "
+                            "WHERE url_id = %s AND page_number = %s",
+                            (gap["url_id"], gap["page_number"]),
+                        )
+                        return {"record": _ff_claim_record(gap), "reclaimed": True}
+
+                    # ── 2) Frontier advance ───────────────────────────────────────
+                    await cur.execute("""
+                        WITH claimed AS (
+                            SELECT id
+                            FROM sn71_ff_request_url
+                            WHERE is_ended = FALSE
+                              AND (current_page = 0
+                                   OR (total_page IS NOT NULL AND current_page < total_page))
+                            ORDER BY current_page ASC, id ASC
+                            LIMIT 1
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE sn71_ff_request_url u
+                        SET current_page = u.current_page + 1,
+                            claimed_at = NOW(),
+                            updated_at = NOW()
+                        FROM claimed
+                        WHERE u.id = claimed.id
+                        RETURNING u.id AS url_id, u.request_id, u.search_url,
+                                  u.current_page AS page_number
+                    """)
+                    row = await cur.fetchone()
+                    if not row:
+                        return {"record": None}
+
+                    await cur.execute(
+                        """
+                        INSERT INTO sn71_ff_page_claim (url_id, page_number)
+                        VALUES (%s, %s)
+                        ON CONFLICT (url_id, page_number) DO UPDATE SET claimed_at = NOW()
+                        """,
+                        (row["url_id"], row["page_number"]),
+                    )
+                    return {"record": _ff_claim_record(row), "reclaimed": False}
+    except Exception as e:
+        logger.error(f"Error claiming ff page: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ff/has-work")
+async def ff_has_work():
+    """Return whether any page is currently claimable (non-mutating).
+
+    True when some open URL can advance its frontier (current_page=0, or
+    total_page known and current_page < total_page) OR a stale gap is awaiting
+    reclaim. Lets a worker cheaply poll for work without opening a browser or
+    claiming a page.
+    """
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT (
+                        EXISTS (
+                            SELECT 1 FROM sn71_ff_request_url
+                            WHERE is_ended = FALSE
+                              AND (current_page = 0
+                                   OR (total_page IS NOT NULL AND current_page < total_page))
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM sn71_ff_page_claim c
+                            JOIN sn71_ff_request_url u ON u.id = c.url_id
+                            WHERE u.is_ended = FALSE
+                              AND c.claimed_at < NOW() - make_interval(secs => %s)
+                              AND (u.total_page IS NULL OR c.page_number <= u.total_page)
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM sn71_ff_page_data d
+                                  WHERE d.url_id = c.url_id AND d.page_number = c.page_number
+                              )
+                        )
+                    ) AS has_work
+                    """,
+                    (FF_CLAIM_STALE_SECONDS,),
+                )
+                row = await cur.fetchone()
+                return {"has_work": bool(row["has_work"])}
+    except Exception as e:
+        logger.error(f"Error checking ff has-work: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ff/page-data")
+async def save_ff_page_data(payload: Dict[str, Any] = Body(...)):
+    """Save one scraped Apollo people page and update the URL's page state.
+
+    Body: {"url_id": int, "page_number": int, "apollo_json": "<raw response body>"}
+    Stores the page's people array as JSONB, derives total_page from pagination
+    on the first page, and marks the URL ended when fully drained.
+    """
+    url_id = payload.get("url_id")
+    page_number = payload.get("page_number")
+    apollo_json_str = payload.get("apollo_json", "")
+    if not url_id:
+        raise HTTPException(status_code=400, detail="url_id is required")
+    if not page_number:
+        raise HTTPException(status_code=400, detail="page_number is required")
+    if not apollo_json_str or not apollo_json_str.strip():
+        raise HTTPException(status_code=400, detail="apollo_json is required")
+
+    try:
+        apollo_data = json.loads(apollo_json_str)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    people = apollo_data.get("people") or []
+    pagination = apollo_data.get("pagination") or {}
+    total_entries = pagination.get("total_entries")
+    per_page = pagination.get("per_page") or (len(people) if people else None) or 25
+    total_pages_field = pagination.get("total_pages")
+
+    # Derive total_page: prefer Apollo's own total_pages, else ceil(total/per_page).
+    total_page = None
+    if isinstance(total_pages_field, int) and total_pages_field > 0:
+        total_page = total_pages_field
+    elif isinstance(total_entries, int) and total_entries >= 0:
+        total_page = max(1, math.ceil(total_entries / per_page))
+
+    try:
+        is_short = (not people) or (len(people) < per_page)
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                # Fetch request_id (denormalized) and current total_page.
+                await cur.execute(
+                    "SELECT request_id, total_page FROM sn71_ff_request_url WHERE id = %s",
+                    (url_id,),
+                )
+                url_row = await cur.fetchone()
+                if not url_row:
+                    raise HTTPException(status_code=404, detail="url_id not found")
+                request_id = url_row["request_id"]
+                existing_total = url_row["total_page"]
+
+                await cur.execute(
+                    """
+                    INSERT INTO sn71_ff_page_data
+                        (url_id, request_id, page_number, people, person_count)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (url_id, page_number) DO UPDATE
+                        SET people = EXCLUDED.people,
+                            person_count = EXCLUDED.person_count,
+                            created_at = NOW()
+                    """,
+                    (url_id, request_id, page_number, Json(people), len(people)),
+                )
+
+                # This page is no longer in-flight — drop its outstanding claim.
+                await cur.execute(
+                    "DELETE FROM sn71_ff_page_claim WHERE url_id = %s AND page_number = %s",
+                    (url_id, page_number),
+                )
+
+                # Resolve the URL's effective total page count:
+                #  - a short/empty page means Apollo has no more data past here, so
+                #    clamp total_page DOWN to this page (Apollo caps below total_entries);
+                #  - otherwise set total_page from this page's pagination if not yet known.
+                effective_total = existing_total
+                if is_short:
+                    if existing_total is None or page_number < existing_total:
+                        effective_total = page_number
+                        await cur.execute(
+                            "UPDATE sn71_ff_request_url SET total_page = %s, updated_at = NOW() WHERE id = %s",
+                            (page_number, url_id),
+                        )
+                        # Discard over-claims past the real end so they aren't reclaimed.
+                        await cur.execute(
+                            "DELETE FROM sn71_ff_page_claim WHERE url_id = %s AND page_number > %s",
+                            (url_id, page_number),
+                        )
+                elif existing_total is None and total_page is not None:
+                    effective_total = total_page
+                    await cur.execute(
+                        "UPDATE sn71_ff_request_url SET total_page = %s, updated_at = NOW() WHERE id = %s",
+                        (total_page, url_id),
+                    )
+
+                # The URL is ended only when every page 1..effective_total is saved
+                # (no gaps) — so a mid-run crash/overlay leaves a gap to reclaim rather
+                # than prematurely closing the URL.
+                ended = False
+                if effective_total is not None:
+                    await cur.execute(
+                        "SELECT COUNT(*) AS n FROM sn71_ff_page_data "
+                        "WHERE url_id = %s AND page_number <= %s",
+                        (url_id, effective_total),
+                    )
+                    saved_count = (await cur.fetchone())["n"]
+                    if saved_count >= effective_total:
+                        ended = True
+                        await cur.execute(
+                            "UPDATE sn71_ff_request_url SET is_ended = TRUE, updated_at = NOW() WHERE id = %s",
+                            (url_id,),
+                        )
+                        # Tidy any leftover claim rows for the finished URL.
+                        await cur.execute(
+                            "DELETE FROM sn71_ff_page_claim WHERE url_id = %s",
+                            (url_id,),
+                        )
+
+                await conn.commit()
+                total_page = effective_total
+        return {
+            "message": "Page saved",
+            "url_id": url_id,
+            "page_number": page_number,
+            "person_count": len(people),
+            "total_page": total_page,
+            "is_ended": ended,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving ff page data for url_id={url_id} page={page_number}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ff/page-claim/release")
+async def release_ff_page_claim(payload: Dict[str, Any] = Body(...)):
+    """Make an in-flight page claim immediately reclaimable.
+
+    Used after an overlay/antibot restart: a worker that lost a page mid-flight
+    releases it so the next /api/ff/page-claim hands it out again without waiting
+    out FF_CLAIM_STALE_SECONDS. Implemented by ageing the claim's claimed_at so
+    the gap-reclaim branch picks it up on the very next claim.
+    """
+    url_id = payload.get("url_id")
+    page_number = payload.get("page_number")
+    if not url_id or not page_number:
+        raise HTTPException(status_code=400, detail="url_id and page_number are required")
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE sn71_ff_page_claim SET claimed_at = TIMESTAMP '1970-01-01' "
+                    "WHERE url_id = %s AND page_number = %s",
+                    (url_id, page_number),
+                )
+                await conn.commit()
+        return {"message": "Claim released for reclaim",
+                "url_id": url_id, "page_number": page_number}
+    except Exception as e:
+        logger.error(f"Error releasing ff claim url_id={url_id} page={page_number}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ff/url/{url_id}/end")
+async def end_ff_url(url_id: int):
+    """Mark an ff URL as ended (is_ended=TRUE) so it is not re-claimed."""
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE sn71_ff_request_url SET is_ended = TRUE, updated_at = NOW() WHERE id = %s",
+                    (url_id,),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="url_id not found")
+                await conn.commit()
+        return {"message": "URL ended", "url_id": url_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error ending ff url {url_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
