@@ -21,6 +21,15 @@ BACKEND_API_URL = os.environ.get("BACKEND_API_URL", "http://95.217.116.91:9900")
 DEBUG_LOG_RESPONSES = os.environ.get("APOLLO_DEBUG_LOG", "").lower() in ("1", "true", "yes")
 # ff_person: how often to poll for new claimable pages while the queue is empty.
 FF_IDLE_POLL_SECONDS = int(os.environ.get("FF_IDLE_POLL_SECONDS", "15"))
+# ff_person: gap (seconds) between two workers OPENING a scraping session, so
+# multiple workers never launch their browsers at the same instant (which would
+# hammer the shared Apollo account/IP and trip Cloudflare). A small RANDOM gap in
+# [MIN, MAX] is applied before each start; starts are serialized so they land
+# orderly (W0 at ~0-10s, W1 a gap after W0, ...). Sessions run concurrently once started.
+FF_START_GAP_MIN_SECONDS = float(os.environ.get("FF_START_GAP_MIN_SECONDS", "0"))
+FF_START_GAP_MAX_SECONDS = float(os.environ.get("FF_START_GAP_MAX_SECONDS", "10"))
+_FF_START_LOCK = asyncio.Lock()
+_ff_last_session_start = [0.0]  # time.monotonic() of the most recent session start
 # Set APOLLO_DISCOVER_ENDPOINTS=1 to log ALL Apollo API calls and discover the company info endpoint
 DISCOVER_ENDPOINTS = os.environ.get("APOLLO_DISCOVER_ENDPOINTS", "").lower() in ("1", "true", "yes")
 
@@ -2059,6 +2068,22 @@ async def _ff_supervise(worker_id: int, args) -> None:
 
         announced_idle = False
         print(f"[W{worker_id}][ff] work available — opening scraping session.")
+        # Space out session starts so workers never launch their browsers at the
+        # same instant. Holding the lock across the wait serializes starts: each
+        # worker begins at least FF_START_GAP_SECONDS after the previous one.
+        async with _FF_START_LOCK:
+            gap = random.uniform(FF_START_GAP_MIN_SECONDS, FF_START_GAP_MAX_SECONDS)
+            now = time.monotonic()
+            # Start `gap` after the later of (now, previous start): gives W0 its own
+            # 0-5s jitter and spaces each later worker a random gap after the prior one.
+            wait = max(now, _ff_last_session_start[0]) + gap - now
+            if wait > 0:
+                print(f"[W{worker_id}][ff] staggering session start by {wait:.1f}s "
+                      f"to avoid simultaneous launches.")
+                await asyncio.sleep(wait)
+            _ff_last_session_start[0] = time.monotonic()
+        if _shutdown_requested[0]:
+            break
         # run_worker opens the browser, drains via run_ff_loop, then closes it and
         # returns. On overlay it sys.exit(2)s (orchestrator restarts). No re-stagger.
         await run_worker(worker_id, args, stagger=False)

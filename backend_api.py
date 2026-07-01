@@ -232,6 +232,20 @@ async def _ensure_ff_tables(conn):
         """)
 
 
+async def _ensure_ff_request_url_region_column(conn):
+    """Add the region column ('US' / 'NONUS') to sn71_ff_request_url if missing.
+
+    Each search URL is tagged US or non-US from the FF Requests dashboard when it
+    is added/edited (see POST /api/ff-requests/{id}/urls and PUT
+    /api/ff-requests/url/{url_id}). Existing rows stay NULL until edited.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute("""
+            ALTER TABLE sn71_ff_request_url
+            ADD COLUMN IF NOT EXISTS region TEXT NULL
+        """)
+
+
 @app.on_event("startup")
 async def startup_event():
     global DB_POOL, WORKER_STATUS_FLUSH_TASK
@@ -273,6 +287,8 @@ async def startup_event():
             logger.info("Ensured sn71_apollo_worker_status table exists")
             await _ensure_ff_tables(conn)
             logger.info("Ensured sn71_ff_request_url and sn71_ff_page_data tables exist")
+            await _ensure_ff_request_url_region_column(conn)
+            logger.info("Ensured sn71_ff_request_url.region column exists")
     except Exception as e:
         logger.error(f"Error running startup database bootstrap tasks: {e}")
         raise
@@ -2823,7 +2839,7 @@ async def get_ff_requests():
                            window_end, reveal_window_end,
                            max_submissions_per_miner
                     FROM sn71_ff_request
-                    WHERE window_end - NOW() > INTERVAL '-48 hour' AND window_end - NOW() < INTERVAL '1 hour 12 minutes'
+                    WHERE window_end - NOW() > INTERVAL '-72 hour' AND window_end - NOW() < INTERVAL '1 hour 12 minutes'
                     ORDER BY window_end DESC
                 """)
                 open_requests = await cur.fetchall()
@@ -2840,7 +2856,7 @@ async def get_ff_requests():
                 req_ids = [r['request_id'] for r in open_requests]
                 if req_ids:
                     await cur.execute("""
-                        SELECT request_id, id AS url_id, search_url,
+                        SELECT request_id, id AS url_id, search_url, region,
                                current_page, total_page, is_ended
                         FROM sn71_ff_request_url
                         WHERE request_id = ANY(%s)
@@ -2850,6 +2866,7 @@ async def get_ff_requests():
                         url_map.setdefault(u['request_id'], []).append({
                             "url_id": u["url_id"],
                             "search_url": u["search_url"],
+                            "region": u["region"],
                             "current_page": u["current_page"],
                             "total_page": u["total_page"],
                             "is_ended": u["is_ended"],
@@ -2893,6 +2910,20 @@ async def get_ff_requests():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _normalize_region(value, default=None):
+    """Validate a region value from a request body.
+
+    Returns 'US' or 'NONUS'. A missing value yields ``default``; a present but
+    invalid value raises 400.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    v = str(value).strip().upper()
+    if v not in ("US", "NONUS"):
+        raise HTTPException(status_code=400, detail="region must be 'US' or 'NONUS'")
+    return v
+
+
 @app.post("/api/ff-requests/{record_id}/urls")
 async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)):
     """Attach a new search URL to an ff-request.
@@ -2902,12 +2933,14 @@ async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)
     the dashboard. A request may hold many URLs; a duplicate (same URL already
     present for the request) is returned as-is rather than re-inserted.
 
-    Body: {"search_url": "https://app.apollo.io/#/people?..."}
+    Body: {"search_url": "https://app.apollo.io/#/people?...", "region": "US"}
+    region is 'US' (default) or 'NONUS'.
     """
     raw = payload.get("search_url")
     search_url = raw.strip() if isinstance(raw, str) else None
     if not search_url:
         raise HTTPException(status_code=400, detail="search_url is required")
+    region = _normalize_region(payload.get("region"), default="US")
 
     try:
         async with DB_POOL.connection() as conn:
@@ -2924,29 +2957,31 @@ async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)
 
                 await cur.execute(
                     """
-                    INSERT INTO sn71_ff_request_url (request_id, search_url)
-                    VALUES (%s, %s)
+                    INSERT INTO sn71_ff_request_url (request_id, search_url, region)
+                    VALUES (%s, %s, %s)
                     ON CONFLICT (request_id, search_url) DO NOTHING
                     RETURNING id
                     """,
-                    (request_id, search_url),
+                    (request_id, search_url, region),
                 )
                 row = await cur.fetchone()
                 if row is None:
                     # URL already attached to this request — return the existing row.
                     await cur.execute(
-                        "SELECT id FROM sn71_ff_request_url WHERE request_id = %s AND search_url = %s",
+                        "SELECT id, region FROM sn71_ff_request_url WHERE request_id = %s AND search_url = %s",
                         (request_id, search_url),
                     )
                     row = await cur.fetchone()
                     await conn.commit()
                     return {"message": "URL already attached", "id": record_id,
                             "request_id": request_id, "url_id": row["id"],
-                            "search_url": search_url, "duplicate": True}
+                            "search_url": search_url, "region": row["region"],
+                            "duplicate": True}
                 await conn.commit()
                 return {"message": "URL added", "id": record_id,
                         "request_id": request_id, "url_id": row["id"],
-                        "search_url": search_url, "duplicate": False}
+                        "search_url": search_url, "region": region,
+                        "duplicate": False}
     except HTTPException:
         raise
     except Exception as e:
@@ -2956,29 +2991,32 @@ async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)
 
 @app.put("/api/ff-requests/url/{url_id}")
 async def edit_ff_request_url(url_id: int, payload: Dict[str, Any] = Body(...)):
-    """Change the search URL of a single sn71_ff_request_url row (by url id).
+    """Change the search URL (and/or region) of one sn71_ff_request_url row.
 
     Scrape progress (cursor, claims, saved pages) is preserved. Rejected with
-    409 if the new URL already exists for the same request.
+    409 if the new URL already exists for the same request. ``region`` is
+    optional ('US' / 'NONUS'); when omitted the existing value is kept.
 
-    Body: {"search_url": "https://app.apollo.io/#/people?..."}
+    Body: {"search_url": "https://app.apollo.io/#/people?...", "region": "US"}
     """
     raw = payload.get("search_url")
     search_url = raw.strip() if isinstance(raw, str) else None
     if not search_url:
         raise HTTPException(status_code=400, detail="search_url is required")
+    region = _normalize_region(payload.get("region"), default=None)
 
     try:
         async with DB_POOL.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT request_id FROM sn71_ff_request_url WHERE id = %s",
+                    "SELECT request_id, region FROM sn71_ff_request_url WHERE id = %s",
                     (url_id,),
                 )
                 row = await cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="URL not found")
                 request_id = row["request_id"]
+                new_region = region if region is not None else row["region"]
 
                 # Guard the UNIQUE (request_id, search_url) constraint.
                 await cur.execute(
@@ -2993,12 +3031,13 @@ async def edit_ff_request_url(url_id: int, payload: Dict[str, Any] = Body(...)):
                     )
 
                 await cur.execute(
-                    "UPDATE sn71_ff_request_url SET search_url = %s, updated_at = NOW() WHERE id = %s",
-                    (search_url, url_id),
+                    "UPDATE sn71_ff_request_url SET search_url = %s, region = %s, updated_at = NOW() WHERE id = %s",
+                    (search_url, new_region, url_id),
                 )
                 await conn.commit()
                 return {"message": "URL updated", "url_id": url_id,
-                        "request_id": request_id, "search_url": search_url}
+                        "request_id": request_id, "search_url": search_url,
+                        "region": new_region}
     except HTTPException:
         raise
     except Exception as e:
@@ -3350,6 +3389,35 @@ async def save_ff_page_data(payload: Dict[str, Any] = Body(...)):
                     raise HTTPException(status_code=404, detail="url_id not found")
                 request_id = url_row["request_id"]
                 existing_total = url_row["total_page"]
+
+                # Guard against a MISFIRED empty page closing the URL. An empty
+                # `people` array only means "end of data" when we've already saved
+                # real data for this URL, or Apollo reports zero results
+                # (total_entries == 0). Otherwise it's a misfire — a soft Cloudflare
+                # block returning 200 with no people, or Apollo's preliminary empty
+                # search fired on page load before the URL filters applied. Saving it
+                # would clamp total_page to this page and set is_ended, permanently
+                # closing a URL that actually has data. So: don't insert, don't clamp,
+                # don't end — leave the URL/claim untouched so the worker retries.
+                if not people:
+                    await cur.execute(
+                        "SELECT 1 FROM sn71_ff_page_data WHERE url_id = %s AND person_count > 0 LIMIT 1",
+                        (url_id,),
+                    )
+                    has_data = await cur.fetchone() is not None
+                    genuinely_empty = isinstance(total_entries, int) and total_entries == 0
+                    if not has_data and not genuinely_empty:
+                        await conn.commit()
+                        logger.warning(
+                            f"Ignoring misfired empty page {page_number} for url_id={url_id} "
+                            f"(total_entries={total_entries}); URL left open for retry."
+                        )
+                        return {
+                            "message": "Empty page ignored (misfire) — URL left open",
+                            "url_id": url_id, "page_number": page_number,
+                            "person_count": 0, "total_page": existing_total,
+                            "is_ended": False, "retry": True,
+                        }
 
                 await cur.execute(
                     """
