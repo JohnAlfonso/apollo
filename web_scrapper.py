@@ -2051,6 +2051,7 @@ async def _ff_supervise(worker_id: int, args) -> None:
 
     print(f"[W{worker_id}][ff] supervisor started — polling for work every {FF_IDLE_POLL_SECONDS}s.")
     announced_idle = False
+    was_idle = True  # startup counts as waking from idle -> stagger the first start
     while not _shutdown_requested[0]:
         try:
             has = await ff_has_work()
@@ -2063,25 +2064,28 @@ async def _ff_supervise(worker_id: int, args) -> None:
             if not announced_idle:
                 print(f"[W{worker_id}][ff] no URLs to scrape — waiting (browser closed).")
                 announced_idle = True
+            was_idle = True  # went idle -> next open is a wake and gets the stagger
             await asyncio.sleep(FF_IDLE_POLL_SECONDS)
             continue
 
         announced_idle = False
         print(f"[W{worker_id}][ff] work available — opening scraping session.")
-        # Space out session starts so workers never launch their browsers at the
-        # same instant. Holding the lock across the wait serializes starts: each
-        # worker begins at least FF_START_GAP_SECONDS after the previous one.
-        async with _FF_START_LOCK:
-            gap = random.uniform(FF_START_GAP_MIN_SECONDS, FF_START_GAP_MAX_SECONDS)
-            now = time.monotonic()
-            # Start `gap` after the later of (now, previous start): gives W0 its own
-            # 0-5s jitter and spaces each later worker a random gap after the prior one.
-            wait = max(now, _ff_last_session_start[0]) + gap - now
-            if wait > 0:
-                print(f"[W{worker_id}][ff] staggering session start by {wait:.1f}s "
-                      f"to avoid simultaneous launches.")
-                await asyncio.sleep(wait)
-            _ff_last_session_start[0] = time.monotonic()
+        # Only stagger on WAKE (idle -> active), so multiple workers waking together
+        # never launch their browsers at the same instant. Continuous re-opens while
+        # already active are not delayed.
+        if was_idle:
+            async with _FF_START_LOCK:
+                gap = random.uniform(FF_START_GAP_MIN_SECONDS, FF_START_GAP_MAX_SECONDS)
+                now = time.monotonic()
+                # Start `gap` after the later of (now, previous start): gives W0 its
+                # own jitter and spaces each later worker a random gap after the prior.
+                wait = max(now, _ff_last_session_start[0]) + gap - now
+                if wait > 0:
+                    print(f"[W{worker_id}][ff] staggering session start by {wait:.1f}s "
+                          f"to avoid simultaneous launches.")
+                    await asyncio.sleep(wait)
+                _ff_last_session_start[0] = time.monotonic()
+            was_idle = False
         if _shutdown_requested[0]:
             break
         # run_worker opens the browser, drains via run_ff_loop, then closes it and
