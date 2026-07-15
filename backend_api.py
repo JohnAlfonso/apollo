@@ -2839,7 +2839,7 @@ async def get_ff_requests():
                            window_end, reveal_window_end,
                            max_submissions_per_miner
                     FROM sn71_ff_request
-                    WHERE window_end - NOW() > INTERVAL '-72 hour' AND window_end - NOW() < INTERVAL '1 hour 12 minutes'
+                    WHERE window_end - NOW() > INTERVAL '-168 hour' AND window_end - NOW() < INTERVAL '1 hour 12 minutes'
                     ORDER BY window_end DESC
                 """)
                 open_requests = await cur.fetchall()
@@ -2924,6 +2924,28 @@ def _normalize_region(value, default=None):
     return v
 
 
+# Apollo people-search returns 25 people per result page, so the number of pages
+# the worker must scrape is ceil(total_person / 25).
+PERSONS_PER_PAGE = 25
+
+
+def _person_count_to_total_page(value):
+    """Convert a requested total-person count into a total_page value.
+
+    Returns ``None`` when the count is absent (caller keeps the existing
+    total_page). A present but non-positive / non-integer value raises 400.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="total_person must be a positive integer")
+    if n <= 0:
+        raise HTTPException(status_code=400, detail="total_person must be a positive integer")
+    return math.ceil(n / PERSONS_PER_PAGE)
+
+
 @app.post("/api/ff-requests/{record_id}/urls")
 async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)):
     """Attach a new search URL to an ff-request.
@@ -2941,6 +2963,7 @@ async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)
     if not search_url:
         raise HTTPException(status_code=400, detail="search_url is required")
     region = _normalize_region(payload.get("region"), default="US")
+    total_page = _person_count_to_total_page(payload.get("total_person"))
 
     try:
         async with DB_POOL.connection() as conn:
@@ -2957,18 +2980,25 @@ async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)
 
                 await cur.execute(
                     """
-                    INSERT INTO sn71_ff_request_url (request_id, search_url, region)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO sn71_ff_request_url (request_id, search_url, region, total_page)
+                    VALUES (%s, %s, %s, %s)
                     ON CONFLICT (request_id, search_url) DO NOTHING
                     RETURNING id
                     """,
-                    (request_id, search_url, region),
+                    (request_id, search_url, region, total_page),
                 )
                 row = await cur.fetchone()
                 if row is None:
-                    # URL already attached to this request — return the existing row.
+                    # URL already attached to this request — update total_page if a
+                    # new person count was supplied, then return the existing row.
+                    if total_page is not None:
+                        await cur.execute(
+                            "UPDATE sn71_ff_request_url SET total_page = %s, updated_at = NOW() "
+                            "WHERE request_id = %s AND search_url = %s",
+                            (total_page, request_id, search_url),
+                        )
                     await cur.execute(
-                        "SELECT id, region FROM sn71_ff_request_url WHERE request_id = %s AND search_url = %s",
+                        "SELECT id, region, total_page FROM sn71_ff_request_url WHERE request_id = %s AND search_url = %s",
                         (request_id, search_url),
                     )
                     row = await cur.fetchone()
@@ -2976,11 +3006,13 @@ async def add_ff_request_url(record_id: int, payload: Dict[str, Any] = Body(...)
                     return {"message": "URL already attached", "id": record_id,
                             "request_id": request_id, "url_id": row["id"],
                             "search_url": search_url, "region": row["region"],
+                            "total_page": row["total_page"],
                             "duplicate": True}
                 await conn.commit()
                 return {"message": "URL added", "id": record_id,
                         "request_id": request_id, "url_id": row["id"],
                         "search_url": search_url, "region": region,
+                        "total_page": total_page,
                         "duplicate": False}
     except HTTPException:
         raise
@@ -3004,12 +3036,13 @@ async def edit_ff_request_url(url_id: int, payload: Dict[str, Any] = Body(...)):
     if not search_url:
         raise HTTPException(status_code=400, detail="search_url is required")
     region = _normalize_region(payload.get("region"), default=None)
+    total_page = _person_count_to_total_page(payload.get("total_person"))
 
     try:
         async with DB_POOL.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT request_id, region FROM sn71_ff_request_url WHERE id = %s",
+                    "SELECT request_id, region, total_page FROM sn71_ff_request_url WHERE id = %s",
                     (url_id,),
                 )
                 row = await cur.fetchone()
@@ -3017,6 +3050,7 @@ async def edit_ff_request_url(url_id: int, payload: Dict[str, Any] = Body(...)):
                     raise HTTPException(status_code=404, detail="URL not found")
                 request_id = row["request_id"]
                 new_region = region if region is not None else row["region"]
+                new_total_page = total_page if total_page is not None else row["total_page"]
 
                 # Guard the UNIQUE (request_id, search_url) constraint.
                 await cur.execute(
@@ -3031,13 +3065,13 @@ async def edit_ff_request_url(url_id: int, payload: Dict[str, Any] = Body(...)):
                     )
 
                 await cur.execute(
-                    "UPDATE sn71_ff_request_url SET search_url = %s, region = %s, updated_at = NOW() WHERE id = %s",
-                    (search_url, new_region, url_id),
+                    "UPDATE sn71_ff_request_url SET search_url = %s, region = %s, total_page = %s, updated_at = NOW() WHERE id = %s",
+                    (search_url, new_region, new_total_page, url_id),
                 )
                 await conn.commit()
                 return {"message": "URL updated", "url_id": url_id,
                         "request_id": request_id, "search_url": search_url,
-                        "region": new_region}
+                        "region": new_region, "total_page": new_total_page}
     except HTTPException:
         raise
     except Exception as e:
@@ -3090,6 +3124,71 @@ async def delete_ff_request_url(url_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/ff-auto-pilot")
+async def get_ff_auto_pilot(limit: int = 100):
+    """Auto-pilot job state (ff_auto_pilot table): which newly opened requests
+    were matched to an old request and auto submitted/revealed, with status."""
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT id, new_request_id, old_request_id, status, detail,
+                           submit_summary, reveal_summary,
+                           window_end, reveal_window_end, created_at, updated_at
+                    FROM ff_auto_pilot
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                """, (min(max(int(limit), 1), 500),))
+                rows = await cur.fetchall()
+        records = []
+        for r in rows:
+            rec = dict(r)
+            for k in ("window_end", "reveal_window_end", "created_at", "updated_at"):
+                if rec.get(k) is not None:
+                    rec[k] = rec[k].isoformat()
+            records.append(rec)
+        return {"records": records}
+    except Exception as e:
+        logger.error(f"Error getting ff-auto-pilot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/ff-auto-pilot/{row_id}")
+async def delete_ff_auto_pilot(row_id: int, force: bool = False):
+    """Delete an ff_auto_pilot job row by id.
+
+    The row IS the dedup lock: deleting a pending/running row would let a poller
+    re-claim and re-run the request (duplicate commit), so those are refused
+    unless force=true. Deleting a terminal row (done/failed/skipped) also drops
+    the "already seen" marker for its new_request_id — if it reappears in the
+    feed it may be reprocessed — so this is a deliberate cleanup action."""
+    try:
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status FROM ff_auto_pilot WHERE id = %s", (row_id,)
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Auto-pilot row not found")
+                status = row["status"] if isinstance(row, dict) else row[0]
+                if status in ("pending", "running") and not force:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Job is {status} (active). Deleting removes its lock and "
+                               f"may cause a re-run. Pass force=true to delete anyway.",
+                    )
+                await cur.execute("DELETE FROM ff_auto_pilot WHERE id = %s", (row_id,))
+                deleted = cur.rowcount
+            await conn.commit()
+        return {"deleted": deleted, "id": row_id, "was_status": status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting ff-auto-pilot row {row_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/ff-open-requests")
 async def get_ff_open_requests():
     """Return open ff-requests with matching data from sn71_ff_data."""
@@ -3112,6 +3211,21 @@ async def get_ff_open_requests():
                 ff_data_rows = await cur.fetchall()
                 ff_data_request_ids = {r['request_id'] for r in ff_data_rows}
 
+                # 2b. CLOSED requests (window already ended, last 30 days) that
+                # have data in sn71_ff_data — candidates for reusing mined data
+                # on a newly opened request with the same ICP (auto-pilot).
+                await cur.execute("""
+                    SELECT id, request_id, icp, window_end
+                    FROM sn71_ff_request
+                    WHERE window_end <= NOW()
+                      AND window_end > NOW() - INTERVAL '30 days'
+                    ORDER BY window_end DESC
+                """)
+                closed_requests = [
+                    r for r in await cur.fetchall()
+                    if r['request_id'] in ff_data_request_ids
+                ]
+
                 # 3. Build response with matching info
                 result = []
                 for r in open_requests:
@@ -3131,6 +3245,16 @@ async def get_ff_open_requests():
                                 if compare_icp(icp, other_r['icp'] or {}):
                                     icp_matches.append(other_r['request_id'])
 
+                    # CLOSED requests with the same ICP and data — most recent
+                    # first (query is window_end DESC). The normal auto-pilot
+                    # source: the old request is usually already closed by the
+                    # time its successor opens.
+                    icp_matches_closed = [
+                        c['request_id'] for c in closed_requests
+                        if c['request_id'] != request_id
+                        and compare_icp(icp, c['icp'] or {})
+                    ]
+
                     result.append({
                         "id": r["id"],
                         "request_id": request_id,
@@ -3141,11 +3265,102 @@ async def get_ff_open_requests():
                         "max_submissions_per_miner": r["max_submissions_per_miner"],
                         "has_ff_data": has_ff_data,
                         "icp_matches": icp_matches,
+                        "icp_matches_closed": icp_matches_closed,
                     })
 
                 return {"records": result}
     except Exception as e:
         logger.error(f"Error getting ff-open-requests: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ff-data")
+async def get_ff_data(
+    page: int = Query(1, ge=1, description="1-based page number"),
+    page_size: int = Query(25, ge=1, le=200, description="Rows per page"),
+):
+    """Grouped view of sn71_ff_data by request_id, joined to sn71_ff_request for
+    ICP / window info. Sorted by most recent (window_end DESC, then max id DESC).
+    Paginated. Each group aggregates per-request counts (leads, intent, final_intent,
+    submissions)."""
+    try:
+        offset = (page - 1) * page_size
+        async with DB_POOL.connection() as conn:
+            async with conn.cursor() as cur:
+                # Total distinct request_ids (for pagination controls)
+                await cur.execute(
+                    "SELECT COUNT(DISTINCT request_id) AS n FROM sn71_ff_data"
+                )
+                row = await cur.fetchone()
+                total = int(row["n"]) if row else 0
+
+                # Aggregate per request_id, then LEFT JOIN the request row for
+                # icp / window_end / num_leads. Only 145-ish groups, so the full
+                # GROUP BY scan is cheap. submission_id_v{n} ? 'submission_id'
+                # counts REAL commits (sentinel {"skipped": ...} rows lack the key).
+                await cur.execute(
+                    """
+                    WITH agg AS (
+                        SELECT
+                            request_id,
+                            COUNT(*)                                                   AS total_rows,
+                            COUNT(*) FILTER (WHERE intent_check IS NOT NULL)           AS intent_checked,
+                            COUNT(*) FILTER (WHERE icp_fit_check IS TRUE)              AS icp_fit,
+                            COUNT(*) FILTER (WHERE final_intent_v1 IS NOT NULL)        AS fi_v1,
+                            COUNT(*) FILTER (WHERE final_intent_v2 IS NOT NULL)        AS fi_v2,
+                            COUNT(*) FILTER (WHERE final_intent_v3 IS NOT NULL)        AS fi_v3,
+                            COUNT(*) FILTER (WHERE submission_id_v1 ? 'submission_id') AS sub_v1,
+                            COUNT(*) FILTER (WHERE submission_id_v2 ? 'submission_id') AS sub_v2,
+                            COUNT(*) FILTER (WHERE submission_id_v3 ? 'submission_id') AS sub_v3,
+                            MAX(id)                                                    AS max_id
+                        FROM sn71_ff_data
+                        GROUP BY request_id
+                    )
+                    SELECT
+                        a.request_id, a.total_rows, a.intent_checked, a.icp_fit,
+                        a.fi_v1, a.fi_v2, a.fi_v3, a.sub_v1, a.sub_v2, a.sub_v3, a.max_id,
+                        r.icp, r.num_leads, r.window_end, r.reveal_window_end,
+                        r.max_submissions_per_miner
+                    FROM agg a
+                    LEFT JOIN sn71_ff_request r ON r.request_id = a.request_id
+                    ORDER BY r.window_end DESC NULLS LAST, a.max_id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (page_size, offset),
+                )
+                rows = await cur.fetchall()
+
+                records = [
+                    {
+                        "request_id": r["request_id"],
+                        "total_rows": r["total_rows"],
+                        "intent_checked": r["intent_checked"],
+                        "icp_fit": r["icp_fit"],
+                        "fi_v1": r["fi_v1"],
+                        "fi_v2": r["fi_v2"],
+                        "fi_v3": r["fi_v3"],
+                        "sub_v1": r["sub_v1"],
+                        "sub_v2": r["sub_v2"],
+                        "sub_v3": r["sub_v3"],
+                        "max_id": r["max_id"],
+                        "icp": r["icp"] or {},
+                        "num_leads": r["num_leads"],
+                        "window_end": r["window_end"].isoformat() if r["window_end"] else None,
+                        "reveal_window_end": r["reveal_window_end"].isoformat() if r["reveal_window_end"] else None,
+                        "max_submissions_per_miner": r["max_submissions_per_miner"],
+                    }
+                    for r in rows
+                ]
+
+                return {
+                    "records": records,
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": max(1, math.ceil(total / page_size)) if total else 1,
+                }
+    except Exception as e:
+        logger.error(f"Error getting ff-data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3441,7 +3656,11 @@ async def save_ff_page_data(payload: Dict[str, Any] = Body(...)):
                 # Resolve the URL's effective total page count:
                 #  - a short/empty page means Apollo has no more data past here, so
                 #    clamp total_page DOWN to this page (Apollo caps below total_entries);
-                #  - otherwise set total_page from this page's pagination if not yet known.
+                #  - otherwise take total_page from this page's pagination when it is
+                #    LARGER than the current value. This lets Apollo's real page count
+                #    override a too-small total_person hint (which is only a floor), so
+                #    is_ended is not set before the real end. The short-page clamp above
+                #    remains the authority for where scraping actually stops.
                 effective_total = existing_total
                 if is_short:
                     if existing_total is None or page_number < existing_total:
@@ -3455,7 +3674,7 @@ async def save_ff_page_data(payload: Dict[str, Any] = Body(...)):
                             "DELETE FROM sn71_ff_page_claim WHERE url_id = %s AND page_number > %s",
                             (url_id, page_number),
                         )
-                elif existing_total is None and total_page is not None:
+                elif total_page is not None and (existing_total is None or total_page > existing_total):
                     effective_total = total_page
                     await cur.execute(
                         "UPDATE sn71_ff_request_url SET total_page = %s, updated_at = NOW() WHERE id = %s",
